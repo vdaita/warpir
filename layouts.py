@@ -56,51 +56,16 @@ class RegTileType:
 class RegVecType:
     pass
 
-class Var(ABC):
-    @abstractmethod
-    def __str__(self) -> str:
-        pass
-
-class GlobalVar(Var):
+class Var():
     def __init__(self, name: str, var_type: GlobalType):
         self.name = name
         self.var_type = var_type
     
     def define(self):
-        ...
+        return f"{self.var_type} {self.name};"
     
     def use(self):
-        ...
-
-class SharedVar(Var):
-    def __init__(self, name: str, var_type: SharedTileType):
-        ...
-    
-    def define(self):
-        ...
-    
-    def use(self):
-        ...
-
-class RegVar(Var):
-    def __init__(self, name: str):
-        ...
-
-    def define(self):
-        ...
-    
-    def use(self):
-        ...
-
-class IntVar(Var):
-    def __init__(self, name: str) -> None:
-        ...
-    
-    def define(self):
-        ...
-    
-    def use(self):
-        ...
+        return self.name
 
 # class WarpTile:
 #     def __init__(self, tile_layout: SharedLayout):
