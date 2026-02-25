@@ -51,13 +51,6 @@ class SizeBytesOfTypeOf:
     def __str__(self) -> str:
         return f"size_bytes<typeof({_fmt(self.var)})>"
 
-class CallExpr:
-    def __init__(self, callee: str, *args: ExprLike):
-        self.callee = callee
-        self.args = args
-
-    def __str__(self) -> str:
-        return f"{self.callee}(" + ", ".join(_fmt(a) for a in self.args) + ")"
 
 class BlockIdx:
     x = BuiltinExpr("blockIdx.x")
@@ -79,6 +72,7 @@ class WarpGroupIdExpr(BuiltinExpr):
 
 WarpId = WarpIdExpr()
 WarpGroupId = WarpGroupIdExpr()
+LaneId = BuiltinExpr("warpgroup::laneid()")
 
 class UnaryOp:
     def __init__(self, op: str, arg: ExprLike):
@@ -196,3 +190,10 @@ class ExpectBytesOp:
 
     def __str__(self) -> str:
         return f"{self.callee}({_fmt(self.sem)}, {_fmt(self.nbytes)})"
+
+class MMAWaitOp:
+    def __init__(self, callee: str = "warpgroup::mma_async_wait"):
+        self.callee = callee
+
+    def __str__(self) -> str:
+        return f"{self.callee}()"

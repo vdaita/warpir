@@ -1,4 +1,4 @@
-from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, IfStmt, DeclStmt, AssignStmt, Warpgroup, Tile, TileQueue, SharedAllocStmt, KernelGlobals, kernel_prelude
+from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, WhileStmt, IfStmt, DeclStmt, AssignStmt, Warpgroup, WarpgroupRegs, WarpgroupDispatch, Pipeline, lane0_if, pipeline_select, Tile, TileQueue, SharedAllocStmt, KernelGlobals, kernel_prelude
 from .layouts import (
     GPUType,
     RegTileLayout,
@@ -13,7 +13,6 @@ from .layouts import (
 )
 from .ops import (
     ExprLike,
-    CallExpr,
     UnaryOp,
     BinaryOp,
     ConstantOp,
@@ -26,16 +25,19 @@ from .ops import (
     WaitOp,
     ArriveOp,
     ExpectBytesOp,
+    MMAWaitOp,
     BlockIdx,
     ThreadIdx,
     WarpId,
     WarpGroupId,
+    LaneId,
     Symbol,
     FieldRef,
     Coord,
     SizeBytesOfTypeOf,
 )
 from .format import format_cpp
+from .compiler import emit_cpp, write_cpp, try_format_cpp
 
 __all__ = [
     "Program",
@@ -43,10 +45,16 @@ __all__ = [
     "RawStmt",
     "ExprStmt",
     "ForStmt",
+    "WhileStmt",
     "IfStmt",
     "DeclStmt",
     "AssignStmt",
     "Warpgroup",
+    "WarpgroupRegs",
+    "WarpgroupDispatch",
+    "Pipeline",
+    "lane0_if",
+    "pipeline_select",
     "Tile",
     "TileQueue",
     "SharedAllocStmt",
@@ -63,7 +71,6 @@ __all__ = [
     "ScalarType",
     "Var",
     "ExprLike",
-    "CallExpr",
     "UnaryOp",
     "BinaryOp",
     "ConstantOp",
@@ -76,13 +83,18 @@ __all__ = [
     "WaitOp",
     "ArriveOp",
     "ExpectBytesOp",
+    "MMAWaitOp",
     "BlockIdx",
     "ThreadIdx",
     "WarpId",
     "WarpGroupId",
+    "LaneId",
     "Symbol",
     "FieldRef",
     "Coord",
     "SizeBytesOfTypeOf",
     "format_cpp",
+    "emit_cpp",
+    "write_cpp",
+    "try_format_cpp",
 ]

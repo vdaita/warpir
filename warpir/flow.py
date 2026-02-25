@@ -4,7 +4,7 @@ from typing import Optional, Sequence, Union
 from abc import ABC, abstractmethod
 from jinja2 import Environment
 from .layouts import Var, SharedTileType, ScalarType
-from .ops import TMALoadOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike, BinaryOp, Symbol, FieldRef, ThreadIdx, WarpId, WarpGroupId, BlockIdx
+from .ops import TMALoadOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike, BinaryOp, Symbol, FieldRef, ThreadIdx, WarpId, WarpGroupId, BlockIdx, LaneId
 
 class Stmt(ABC):
     @abstractmethod
@@ -149,6 +149,86 @@ class Warpgroup(Stmt): # TODO: implement a full, functional warpgroup object tha
         body = str(body_stmt).rstrip()
         return tmpl.render(wid=self.id, body=body)
 
+class WarpgroupRegs(Stmt):
+    def __init__(self, count: int, action: str = "increase"):
+        if action not in ("increase", "decrease"):
+            raise ValueError(f"invalid action: {action}")
+        self.count = count
+        self.action = action
+
+    def __str__(self) -> str:
+        return f"warpgroup::{self.action}_registers<{self.count}>();"
+
+class WarpgroupDispatch(Stmt):
+    def __init__(self, warpgroupid: ExprLike, cases: Sequence[tuple[int, Stmt]], default: Optional[Stmt] = None):
+        self.warpgroupid = warpgroupid
+        self.cases = list(cases)
+        self.default = default
+
+    def __str__(self) -> str:
+        parts: list[str] = []
+        for idx, (wid, stmt) in enumerate(self.cases):
+            head = "if" if idx == 0 else "else if"
+            body = str(stmt).rstrip()
+            parts.append(f"{head} ({self.warpgroupid} == {wid}) {{\n{body}\n}}")
+        if self.default is not None:
+            parts.append(f"else {{\n{str(self.default).rstrip()}\n}}")
+        return "\n".join(parts)
+
+class Pipeline:
+    def __init__(self, stages_sym: ExprLike, tile: Var, qidx: Var, phase: Var):
+        self.stages_sym = stages_sym
+        self.tile = tile
+        self.qidx = qidx
+        self.phase = phase
+
+    def on_qidx(self, s0: Stmt, s1: Stmt) -> Stmt:
+        return IfStmt(BinaryOp("==", self.qidx, 0), s0, s1)
+
+    def select(self, cases: Sequence[Stmt], default: Optional[Stmt] = None) -> Stmt:
+        if not cases:
+            return default or NoStmt()
+        chain: Stmt = cases[0]
+        for idx, stmt in enumerate(cases[1:], start=1):
+            chain = IfStmt(BinaryOp("==", self.qidx, idx), stmt, chain)
+        if default is None:
+            return chain
+        return IfStmt(BinaryOp(">=", self.qidx, len(cases)), default, chain)
+
+    def toggle(self) -> Stmt:
+        return IfStmt(
+            BinaryOp("==", self.qidx, self.stages_sym),
+            SeqStmt([AssignStmt(self.qidx, 0), AssignStmt(self.phase, BinaryOp("^", self.phase, 1))]),
+        )
+
+    def loop(self, num_tiles: Var, body: Stmt) -> Stmt:
+        return SeqStmt([
+            DeclStmt(self.tile, 0),
+            DeclStmt(self.qidx, 0),
+            WhileStmt(
+                BinaryOp("<", self.tile, num_tiles),
+                SeqStmt([
+                    self.toggle(),
+                    body,
+                    AssignStmt(self.tile, BinaryOp("+", self.tile, 1)),
+                    AssignStmt(self.qidx, BinaryOp("+", self.qidx, 1)),
+                ]),
+            ),
+        ])
+
+def lane0_if(stmt: Stmt) -> Stmt:
+    return IfStmt(BinaryOp("==", LaneId, 0), stmt)
+
+def pipeline_select(qidx: ExprLike, cases: Sequence[Stmt], default: Optional[Stmt] = None) -> Stmt:
+    if not cases:
+        return default or NoStmt()
+    chain: Stmt = cases[0]
+    for idx, stmt in enumerate(cases[1:], start=1):
+        chain = IfStmt(BinaryOp("==", qidx, idx), stmt, chain)
+    if default is None:
+        return chain
+    return IfStmt(BinaryOp(">=", qidx, len(cases)), default, chain)
+
 class KernelGlobals:
     def __init__(self, **vars_by_name):
         self._vars = [Var(name, vtype) for name, vtype in vars_by_name.items()]
@@ -182,6 +262,11 @@ def kernel_prelude(
     col: Var,
     tiles: Sequence[Tile],
     queues: Sequence[TileQueue],
+    num_tiles: Var,
+    warpid: Var,
+    warpgroupid: Var,
+    num_consumers: Var,
+    qsize_sym: Optional[ExprLike] = None,
 ) -> SeqStmt:
     return SeqStmt([
         RawStmt(f"static constexpr int BLOCK_SIZE = {block_size};"),
@@ -191,10 +276,10 @@ def kernel_prelude(
         RawStmt("shared_allocator al((int*)&__shm[0]);"),
         DeclStmt(row, BlockIdx.y),
         DeclStmt(col, BlockIdx.x),
-        DeclStmt(Var("num_tiles", ScalarType("int")), f"({g}.N + BLOCK_SIZE - 1) / BLOCK_SIZE"),
-        DeclStmt(Var("warpid", ScalarType("int")), WarpId),
-        DeclStmt(Var("warpgroupid", ScalarType("int")), WarpGroupId),
-        DeclStmt(Var("num_consumers", ScalarType("int")), "(NUM_THREADS / 128) - 1"),
+        DeclStmt(num_tiles, f"({g}.N + BLOCK_SIZE - 1) / BLOCK_SIZE"),
+        DeclStmt(warpid, WarpId),
+        DeclStmt(warpgroupid, WarpGroupId),
+        DeclStmt(num_consumers, "(NUM_THREADS / 128) - 1"),
         *[t.def_() for t in tiles],
         *[q.declare_semaphores() for q in queues],
         IfStmt(BinaryOp("==", ThreadIdx.x, 0),
