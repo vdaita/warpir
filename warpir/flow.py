@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from typing import Optional, Sequence, Union
 from abc import ABC, abstractmethod
 from jinja2 import Environment
-from .layouts import Var, SharedTileType
-from .ops import TMALoadOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike, BinaryOp
+from .layouts import Var, SharedTileType, ScalarType
+from .ops import TMALoadOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike, BinaryOp, Symbol, FieldRef, ThreadIdx, WarpId, WarpGroupId, BlockIdx
 
 class Stmt(ABC):
     @abstractmethod
@@ -147,6 +149,59 @@ class Warpgroup(Stmt): # TODO: implement a full, functional warpgroup object tha
         body = str(body_stmt).rstrip()
         return tmpl.render(wid=self.id, body=body)
 
+class KernelGlobals:
+    def __init__(self, **vars_by_name):
+        self._vars = [Var(name, vtype) for name, vtype in vars_by_name.items()]
+        self._var_map = {v.name: v for v in self._vars}
+        self._sym = Symbol("g")
+
+    @property
+    def vars(self) -> Sequence[Var]:
+        return self._vars
+
+    def __iter__(self):
+        return iter(self._vars)
+
+    def __str__(self) -> str:
+        return str(self._sym)
+
+    def __getattr__(self, name: str):
+        if name in self._var_map:
+            return FieldRef(self._sym, name)
+        raise AttributeError(name)
+
+    def var(self, name: str) -> Var:
+        return self._var_map[name]
+
+
+def kernel_prelude(
+    block_size: int,
+    qsize: int,
+    g: KernelGlobals,
+    row: Var,
+    col: Var,
+    tiles: Sequence[Tile],
+    queues: Sequence[TileQueue],
+) -> SeqStmt:
+    return SeqStmt([
+        RawStmt(f"static constexpr int BLOCK_SIZE = {block_size};"),
+        RawStmt(f"static constexpr int QSIZE = {qsize};"),
+        RawStmt("static constexpr int NUM_THREADS = 8 * kittens::WARP_THREADS;"),
+        RawStmt("extern __shared__ alignment_dummy __shm[];"),
+        RawStmt("shared_allocator al((int*)&__shm[0]);"),
+        DeclStmt(row, BlockIdx.y),
+        DeclStmt(col, BlockIdx.x),
+        DeclStmt(Var("num_tiles", ScalarType("int")), f"({g}.N + BLOCK_SIZE - 1) / BLOCK_SIZE"),
+        DeclStmt(Var("warpid", ScalarType("int")), WarpId),
+        DeclStmt(Var("warpgroupid", ScalarType("int")), WarpGroupId),
+        DeclStmt(Var("num_consumers", ScalarType("int")), "(NUM_THREADS / 128) - 1"),
+        *[t.def_() for t in tiles],
+        *[q.declare_semaphores() for q in queues],
+        IfStmt(BinaryOp("==", ThreadIdx.x, 0),
+               SeqStmt([q.init_semaphores(0, "num_consumers") for q in queues])),
+        RawStmt("__syncthreads();"),
+    ])
+
 class Tile:
     def __init__(
         self,
@@ -171,6 +226,15 @@ class Tile:
         if self._is_shared():
             return SharedAllocStmt(self.name, self.tile_type, allocator=self.allocator)
         return DeclStmt(Var(self.name, self.tile_type))
+
+    def def_(self) -> Stmt:
+        return self.declare()
+
+    def ref(self):
+        return Symbol(self.name)
+
+    def __str__(self) -> str:
+        return self.name
 
     def declare_semaphores(self, shared: bool = True) -> Stmt:
         if not self.use_semaphores:
@@ -289,14 +353,18 @@ __global__ void kernel(const __grid_constant__ kernel_globals g) {
 }
 """
 class Program:
-    def __init__(self, input_vars: Sequence[Var], kernel_vars: Sequence[Var], kernel_stmt: Stmt):
+    def __init__(self, input_vars: Sequence[Var], kernel_vars, kernel_stmt: Stmt):
         self.input_vars = input_vars
         self.kernel_vars = kernel_vars
         self.kernel_stmt = kernel_stmt
     
     def __str__(self):
+        if isinstance(self.kernel_vars, KernelGlobals):
+            kernel_vars = self.kernel_vars.vars
+        else:
+            kernel_vars = self.kernel_vars
         t = _ENV.from_string(KITTENS_TEMPLATE)
         return t.render(
-            kernel_vars=self.kernel_vars,
+            kernel_vars=kernel_vars,
             kernel_stmt=self.kernel_stmt
         )

@@ -1,4 +1,4 @@
-from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, IfStmt, DeclStmt, Warpgroup, Tile, TileQueue, SharedAllocStmt
+from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, IfStmt, DeclStmt, AssignStmt, Warpgroup, Tile, TileQueue, SharedAllocStmt, KernelGlobals, kernel_prelude
 from .layouts import (
     GPUType,
     RegTileLayout,
@@ -13,6 +13,7 @@ from .layouts import (
 )
 from .ops import (
     ExprLike,
+    CallExpr,
     UnaryOp,
     BinaryOp,
     ConstantOp,
@@ -44,10 +45,13 @@ __all__ = [
     "ForStmt",
     "IfStmt",
     "DeclStmt",
+    "AssignStmt",
     "Warpgroup",
     "Tile",
     "TileQueue",
     "SharedAllocStmt",
+    "KernelGlobals",
+    "kernel_prelude",
     "GPUType",
     "RegTileLayout",
     "SharedTileLayout",
@@ -59,6 +63,7 @@ __all__ = [
     "ScalarType",
     "Var",
     "ExprLike",
+    "CallExpr",
     "UnaryOp",
     "BinaryOp",
     "ConstantOp",

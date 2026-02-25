@@ -51,6 +51,14 @@ class SizeBytesOfTypeOf:
     def __str__(self) -> str:
         return f"size_bytes<typeof({_fmt(self.var)})>"
 
+class CallExpr:
+    def __init__(self, callee: str, *args: ExprLike):
+        self.callee = callee
+        self.args = args
+
+    def __str__(self) -> str:
+        return f"{self.callee}(" + ", ".join(_fmt(a) for a in self.args) + ")"
+
 class BlockIdx:
     x = BuiltinExpr("blockIdx.x")
     y = BuiltinExpr("blockIdx.y")
