@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 from abc import ABC, abstractmethod
 
 class GPUType(str, Enum):
@@ -27,7 +27,14 @@ class SharedTileType:
             return f"st_fl<{self.tile_w}, {self.tile_h}, {self.layout}>"
 
 class SharedVecType:
-    pass
+    def __init__(self, data_type: GPUType, length: int):
+        self.data_type = data_type
+        self.length = length
+
+    def __str__(self):
+        if self.data_type == GPUType.bf16:
+            return f"sv_bf<{self.length}>"
+        return f"sv_fl<{self.length}>"
 
 class GlobalType:
     def __init__(self, data_type: GPUType, sub_tile: SharedTileType, batch_dim: Optional[int] = -1, depth_dim: Optional[int] = -1, height_dim: Optional[int] = -1, width_dim: Optional[int] = -1):
@@ -54,10 +61,34 @@ class RegTileType:
             return f"rt_fl<{self.tile_w}, {self.tile_h}, {self.layout}>"
 
 class RegVecType:
-    pass
+    def __init__(self, data_type: GPUType, length: int):
+        self.data_type = data_type
+        self.length = length
+
+    def __str__(self):
+        if self.data_type == GPUType.bf16:
+            return f"rv_bf<{self.length}>"
+        return f"rv_fl<{self.length}>"
+
+class ScalarType:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __str__(self):
+        return self.name
+
+VarType = Union[
+    GlobalType,
+    SharedTileType,
+    RegTileType,
+    SharedVecType,
+    RegVecType,
+    ScalarType,
+    str,
+]
 
 class Var():
-    def __init__(self, name: str, var_type: GlobalType):
+    def __init__(self, name: str, var_type: VarType):
         self.name = name
         self.var_type = var_type
     
@@ -65,6 +96,9 @@ class Var():
         return f"{self.var_type} {self.name};"
     
     def use(self):
+        return self.name
+
+    def __str__(self):
         return self.name
 
 # class WarpTile:

@@ -6,4 +6,19 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "jinja2>=3.1.6",
+    "clang-format>=17.0.0",
 ]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["warpir"]
+
+[tool.pyrefly]
+project-includes = ["**/*.py*"]
+ignore-missing-imports = ["jinja2"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
