@@ -6,6 +6,7 @@ from warpir import (
     ForStmt,
     IfStmt,
     Tile,
+    TileQueue,
     DeclStmt,
     SharedTileType,
     SharedTileLayout,
@@ -36,11 +37,14 @@ def build_gemm_kernel() -> Program:
     A = Var("A", tile_gl)
     B = Var("B", tile_gl)
     C = Var("C", tile_gl)
+    N = Var("N", ScalarType("int"))
     g = Symbol("g")
     num_tiles = Symbol("num_tiles")
 
     As = [Tile(f"As_{i}", sub_tile) for i in range(qsize)]
     Bs = [Tile(f"Bs_{i}", sub_tile) for i in range(qsize)]
+    q0 = TileQueue("q0", [As[0], Bs[0]])
+    q1 = TileQueue("q1", [As[1], Bs[1]])
 
     def on_qidx(stmt0, stmt1):
         return IfStmt("qidx == 0", stmt0, stmt1)
@@ -58,12 +62,14 @@ def build_gemm_kernel() -> Program:
         body=SeqStmt([
             IfStmt("qidx == QSIZE", RawStmt("qidx = 0; p ^= 1;")),
             on_qidx(
-                As[0].produce(g.A, Coord(0, 0, row, tile), phase=p),
-                As[1].produce(g.A, Coord(0, 0, row, tile), phase=p),
-            ),
-            on_qidx(
-                Bs[0].produce(g.B, Coord(0, 0, tile, col), phase=p),
-                Bs[1].produce(g.B, Coord(0, 0, tile, col), phase=p),
+                q0.produce(
+                    [(As[0], g.A, Coord(0, 0, row, tile)), (Bs[0], g.B, Coord(0, 0, tile, col))],
+                    phase=p,
+                ),
+                q1.produce(
+                    [(As[1], g.A, Coord(0, 0, row, tile)), (Bs[1], g.B, Coord(0, 0, tile, col))],
+                    phase=p,
+                ),
             ),
         ]),
     )
@@ -83,11 +89,11 @@ def build_gemm_kernel() -> Program:
         body=SeqStmt([
             IfStmt("qidx == QSIZE", RawStmt("qidx = 0; p ^= 1;")),
             on_qidx(
-                As[0].consume(p, SeqStmt([
+                q0.consume(p, SeqStmt([
                     ExprStmt(MMAOp("C_accum", "As_0", "Bs_0")),
                     RawStmt("warpgroup::mma_async_wait();"),
                 ]), arrive=False),
-                As[1].consume(p, SeqStmt([
+                q1.consume(p, SeqStmt([
                     ExprStmt(MMAOp("C_accum", "As_1", "Bs_1")),
                     RawStmt("warpgroup::mma_async_wait();"),
                 ]), arrive=False),
@@ -95,8 +101,8 @@ def build_gemm_kernel() -> Program:
             IfStmt(
                 "warpgroup::laneid() == 0",
                 on_qidx(
-                    Bs[0].consume(None, SeqStmt([]), arrive=True),
-                    Bs[1].consume(None, SeqStmt([]), arrive=True),
+                    ExprStmt(ArriveOp(q0.empty_sem, 1)),
+                    ExprStmt(ArriveOp(q1.empty_sem, 1)),
                 ),
             ),
         ]),
@@ -106,12 +112,10 @@ def build_gemm_kernel() -> Program:
         RawStmt("warpgroup::increase_registers<256>();"),
         RawStmt("rt_fl<16, BLOCK_SIZE> C_accum;"),
         RawStmt("kittens::warp::zero(C_accum);"),
-        IfStmt("warpgroup::laneid() == 0", ForStmt(
-            init="int i = 0",
-            cond="i < QSIZE",
-            step="++i",
-            body=ExprStmt(ArriveOp("empty[i]", 1)),
-        )),
+        IfStmt("warpgroup::laneid() == 0", SeqStmt([
+            ExprStmt(ArriveOp(q0.empty_sem, 1)),
+            ExprStmt(ArriveOp(q1.empty_sem, 1)),
+        ])),
         RawStmt("int p = 0;"),
         consumer_loop,
         ExprStmt(StoreOp("g.C", "C_accum", "{0, 0, row, col}")),
@@ -131,11 +135,11 @@ def build_gemm_kernel() -> Program:
         DeclStmt(Var("num_consumers", ScalarType("int")), "(NUM_THREADS / 128) - 1"),
         *[t.declare() for t in As],
         *[t.declare() for t in Bs],
-        *[t.declare_semaphores() for t in As],
-        *[t.declare_semaphores() for t in Bs],
+        q0.declare_semaphores(),
+        q1.declare_semaphores(),
         IfStmt(str(ThreadIdx.x) + " == 0", SeqStmt([
-            *[t.init_semaphores(0, "num_consumers") for t in As],
-            *[t.init_semaphores(0, "num_consumers") for t in Bs],
+            q0.init_semaphores(0, "num_consumers"),
+            q1.init_semaphores(0, "num_consumers"),
         ])),
         RawStmt("__syncthreads();"),
         IfStmt("warpgroupid == 0", producer, consumer),
@@ -143,7 +147,7 @@ def build_gemm_kernel() -> Program:
 
     return Program(
         input_vars=[],
-        kernel_vars=[A, B, C],
+        kernel_vars=[A, B, C, N],
         kernel_stmt=kernel_stmt,
     )
 

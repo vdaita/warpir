@@ -1,8 +1,8 @@
 from typing import Optional, Sequence, Union
 from abc import ABC, abstractmethod
 from jinja2 import Environment
-from .layouts import Var
-from .ops import TMALoadOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike
+from .layouts import Var, SharedTileType
+from .ops import TMALoadOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike, BinaryOp
 
 class Stmt(ABC):
     @abstractmethod
@@ -100,6 +100,22 @@ class DeclStmt(Stmt):
         tmpl = _ENV.from_string("{{ type }} {{ name }} = {{ init }};")
         return tmpl.render(type=self.var.var_type, name=self.var.name, init=str(self.init))
 
+class SharedAllocStmt(Stmt):
+    def __init__(self, name: str, tile_type, allocator: str = "al", count: Optional[ExprLike] = None):
+        self.name = name
+        self.tile_type = tile_type
+        self.allocator = allocator
+        self.count = count
+
+    def __str__(self) -> str:
+        if self.count is None:
+            tmpl = _ENV.from_string("{{ type }} (&{{ name }}) = {{ alloc }}.allocate<{{ type }}>();")
+            return tmpl.render(type=self.tile_type, name=self.name, alloc=self.allocator)
+        tmpl = _ENV.from_string(
+            "{{ type }} (&{{ name }})[{{ count }}] = {{ alloc }}.allocate<{{ type }}, {{ count }}>();"
+        )
+        return tmpl.render(type=self.tile_type, name=self.name, alloc=self.allocator, count=str(self.count))
+
 class IfStmt(Stmt):
     def __init__(self, cond: ExprLike, then_stmt: Stmt, else_stmt: Optional[Stmt] = None):
         self.cond = cond
@@ -139,14 +155,21 @@ class Tile:
         use_semaphores: bool = True,
         full_sem: Optional[str] = None,
         empty_sem: Optional[str] = None,
+        allocator: str = "al",
     ):
         self.name = name
         self.tile_type = tile_type
         self.use_semaphores = use_semaphores
         self.full_sem = full_sem or f"full_{name}"
         self.empty_sem = empty_sem or f"empty_{name}"
+        self.allocator = allocator
+
+    def _is_shared(self) -> bool:
+        return isinstance(self.tile_type, SharedTileType)
 
     def declare(self) -> Stmt:
+        if self._is_shared():
+            return SharedAllocStmt(self.name, self.tile_type, allocator=self.allocator)
         return DeclStmt(Var(self.name, self.tile_type))
 
     def declare_semaphores(self, shared: bool = True) -> Stmt:
@@ -200,6 +223,52 @@ class Tile:
             seq.append(ExprStmt(ArriveOp(self.empty_sem, arrive_count)))
         return SeqStmt(seq)
 
+class TileQueue:
+    def __init__(self, name: str, tiles: Sequence[Tile], full_sem: Optional[str] = None, empty_sem: Optional[str] = None):
+        self.name = name
+        self.tiles = tiles
+        self.full_sem = full_sem or f"full_{name}"
+        self.empty_sem = empty_sem or f"empty_{name}"
+        for t in self.tiles:
+            t.full_sem = self.full_sem
+            t.empty_sem = self.empty_sem
+
+    def declare_semaphores(self, shared: bool = True) -> Stmt:
+        prefix = "__shared__ " if shared else ""
+        return RawStmt(f"{prefix}semaphore {self.full_sem}, {self.empty_sem};")
+
+    def init_semaphores(self, full_init: Union[str, int], empty_init: Union[str, int]) -> Stmt:
+        return SeqStmt([
+            RawStmt(f"init_semaphore({self.full_sem}, {full_init}, 1);"),
+            RawStmt(f"init_semaphore({self.empty_sem}, {empty_init}, 0);"),
+        ])
+
+    def produce(
+        self,
+        loads: Sequence[tuple[Tile, ExprLike, ExprLike]],
+        phase: ExprLike,
+        expect_bytes: Optional[ExprLike] = None,
+    ) -> Stmt:
+        if expect_bytes is None:
+            sizes = [SizeBytesOfTypeOf(t.name) for t, _, _ in loads]
+            if sizes:
+                total: ExprLike = sizes[0]
+                for s in sizes[1:]:
+                    total = BinaryOp("+", total, s)
+                expect_bytes = total
+        seq: list[Stmt] = [ExprStmt(WaitOp(self.empty_sem, phase))]
+        if expect_bytes is not None:
+            seq.append(ExprStmt(ExpectBytesOp(self.full_sem, expect_bytes)))
+        for t, src, coord in loads:
+            seq.append(ExprStmt(TMALoadOp(t.name, src, coord, self.full_sem)))
+        return SeqStmt(seq)
+
+    def consume(self, phase: ExprLike, body: Stmt, arrive: bool = True, arrive_count: ExprLike = 1) -> Stmt:
+        seq: list[Stmt] = [ExprStmt(WaitOp(self.full_sem, phase)), body]
+        if arrive:
+            seq.append(ExprStmt(ArriveOp(self.empty_sem, arrive_count)))
+        return SeqStmt(seq)
+
 KITTENS_TEMPLATE = """
 #include <iostream>
 #include <random>
@@ -211,7 +280,7 @@ using namespace kittens;
 
 struct kernel_globals {
     {%- for var in kernel_vars %}
-    {{ var.define() }};
+    {{ var.define() }}
     {%- endfor %}
 };
 

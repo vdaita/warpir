@@ -1,4 +1,4 @@
-from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, IfStmt, DeclStmt, Warpgroup, Tile
+from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, IfStmt, DeclStmt, Warpgroup, Tile, TileQueue, SharedAllocStmt
 from .layouts import (
     GPUType,
     RegTileLayout,
@@ -46,6 +46,8 @@ __all__ = [
     "DeclStmt",
     "Warpgroup",
     "Tile",
+    "TileQueue",
+    "SharedAllocStmt",
     "GPUType",
     "RegTileLayout",
     "SharedTileLayout",
