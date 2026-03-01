@@ -1,0 +1,8 @@
+jinja2>=3.1.6
+clang-format>=17.0.0
+pyrefly>=0.54.0
+torch>=2.10.0
+torchvision>=0.25.0
+torchaudio>=2.10.0
+setuptools>=82.0.0
+ninja>=1.13.0

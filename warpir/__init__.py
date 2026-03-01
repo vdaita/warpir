@@ -1,4 +1,4 @@
-from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, WhileStmt, IfStmt, DeclStmt, AssignStmt, Warpgroup, WarpgroupRegs, WarpgroupDispatch, Pipeline, lane0_if, pipeline_select, Tile, TileQueue, SharedAllocStmt, KernelGlobals, kernel_prelude
+from .flow import Program, SeqStmt, RawStmt, ExprStmt, ForStmt, WhileStmt, IfStmt, DeclStmt, AssignStmt, Warpgroup, WarpgroupDispatch, lane0_if, Tile, SharedAllocStmt, KernelGlobals, OpCall
 from .layouts import (
     GPUType,
     RegTileLayout,
@@ -35,6 +35,8 @@ from .ops import (
     FieldRef,
     Coord,
     SizeBytesOfTypeOf,
+    getConst,
+    OpCallExpr,
 )
 from .format import format_cpp
 from .compiler import emit_cpp, write_cpp, try_format_cpp
@@ -50,16 +52,11 @@ __all__ = [
     "DeclStmt",
     "AssignStmt",
     "Warpgroup",
-    "WarpgroupRegs",
     "WarpgroupDispatch",
-    "Pipeline",
     "lane0_if",
-    "pipeline_select",
     "Tile",
-    "TileQueue",
     "SharedAllocStmt",
     "KernelGlobals",
-    "kernel_prelude",
     "GPUType",
     "RegTileLayout",
     "SharedTileLayout",
@@ -93,6 +90,9 @@ __all__ = [
     "FieldRef",
     "Coord",
     "SizeBytesOfTypeOf",
+    "getConst",
+    "OpCall",
+    "OpCallExpr",
     "format_cpp",
     "emit_cpp",
     "write_cpp",

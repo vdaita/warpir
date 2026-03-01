@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: warpir
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: jinja2>=3.1.6
+Requires-Dist: clang-format>=17.0.0
+Requires-Dist: pyrefly>=0.54.0
+Requires-Dist: torch>=2.10.0
+Requires-Dist: torchvision>=0.25.0
+Requires-Dist: torchaudio>=2.10.0
+Requires-Dist: setuptools>=82.0.0
+Requires-Dist: ninja>=1.13.0

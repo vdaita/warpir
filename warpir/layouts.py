@@ -101,13 +101,6 @@ class Var():
     def __str__(self):
         return self.name
 
-# class WarpTile:
-#     def __init__(self, tile_layout: SharedLayout):
-#         ...
-#         # initialize semaphores for empty / full (writers have to wait for empty, consumers have to wait for full)
-    
-#     def consume(self) -> Var:
-#         ...
-    
-#     def produce(self) -> Var:
-#         ...
+from .ops import ExprBase
+for name in ["__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__", "__div__", "__truediv__", "__mod__", "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"]:
+    setattr(Var, name, getattr(ExprBase, name))

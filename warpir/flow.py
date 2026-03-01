@@ -4,7 +4,8 @@ from typing import Optional, Sequence, Union
 from abc import ABC, abstractmethod
 from jinja2 import Environment
 from .layouts import Var, SharedTileType, ScalarType
-from .ops import TMALoadOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike, BinaryOp, Symbol, FieldRef, ThreadIdx, WarpId, WarpGroupId, BlockIdx, LaneId
+from .ops import TMALoadOp, TMAStoreOp, WaitOp, ExpectBytesOp, ArriveOp, SizeBytesOfTypeOf, ExprLike, BinaryOp, Symbol, FieldRef, ThreadIdx, WarpId, WarpGroupId, BlockIdx, LaneId, OpCallExpr
+
 
 class Stmt(ABC):
     @abstractmethod
@@ -56,8 +57,13 @@ class NoStmt(Stmt):
         return ""
 
 class SeqStmt(Stmt):
-    def __init__(self, stmts: Sequence[Stmt]):
-        self.stmts = stmts
+    def __init__(self, stmts: Sequence[Union[Stmt, ExprLike]]):
+        self.stmts = []
+        for s in stmts:
+            if isinstance(s, Stmt):
+                self.stmts.append(s)
+            else:
+                self.stmts.append(ExprStmt(s))
     
     def __str__(self):
         rendered = [str(stmt).rstrip() for stmt in self.stmts if str(stmt).strip()]
@@ -81,6 +87,9 @@ class ExprStmt(Stmt):
         if text.endswith(";"):
             return text
         return f"{text};"
+
+def OpCall(callee: str, *args: ExprLike) -> Stmt:
+    return ExprStmt(OpCallExpr(callee, *args))
 
 class AssignStmt(Stmt):
     def __init__(self, lhs: ExprLike, rhs: ExprLike):
@@ -149,16 +158,6 @@ class Warpgroup(Stmt): # TODO: implement a full, functional warpgroup object tha
         body = str(body_stmt).rstrip()
         return tmpl.render(wid=self.id, body=body)
 
-class WarpgroupRegs(Stmt):
-    def __init__(self, count: int, action: str = "increase"):
-        if action not in ("increase", "decrease"):
-            raise ValueError(f"invalid action: {action}")
-        self.count = count
-        self.action = action
-
-    def __str__(self) -> str:
-        return f"warpgroup::{self.action}_registers<{self.count}>();"
-
 class WarpgroupDispatch(Stmt):
     def __init__(self, warpgroupid: ExprLike, cases: Sequence[tuple[int, Stmt]], default: Optional[Stmt] = None):
         self.warpgroupid = warpgroupid
@@ -175,59 +174,12 @@ class WarpgroupDispatch(Stmt):
             parts.append(f"else {{\n{str(self.default).rstrip()}\n}}")
         return "\n".join(parts)
 
-class Pipeline:
-    def __init__(self, stages_sym: ExprLike, tile: Var, qidx: Var, phase: Var):
-        self.stages_sym = stages_sym
-        self.tile = tile
-        self.qidx = qidx
-        self.phase = phase
 
-    def on_qidx(self, s0: Stmt, s1: Stmt) -> Stmt:
-        return IfStmt(BinaryOp("==", self.qidx, 0), s0, s1)
-
-    def select(self, cases: Sequence[Stmt], default: Optional[Stmt] = None) -> Stmt:
-        if not cases:
-            return default or NoStmt()
-        chain: Stmt = cases[0]
-        for idx, stmt in enumerate(cases[1:], start=1):
-            chain = IfStmt(BinaryOp("==", self.qidx, idx), stmt, chain)
-        if default is None:
-            return chain
-        return IfStmt(BinaryOp(">=", self.qidx, len(cases)), default, chain)
-
-    def toggle(self) -> Stmt:
-        return IfStmt(
-            BinaryOp("==", self.qidx, self.stages_sym),
-            SeqStmt([AssignStmt(self.qidx, 0), AssignStmt(self.phase, BinaryOp("^", self.phase, 1))]),
-        )
-
-    def loop(self, num_tiles: Var, body: Stmt) -> Stmt:
-        return SeqStmt([
-            DeclStmt(self.tile, 0),
-            DeclStmt(self.qidx, 0),
-            WhileStmt(
-                BinaryOp("<", self.tile, num_tiles),
-                SeqStmt([
-                    self.toggle(),
-                    body,
-                    AssignStmt(self.tile, BinaryOp("+", self.tile, 1)),
-                    AssignStmt(self.qidx, BinaryOp("+", self.qidx, 1)),
-                ]),
-            ),
-        ])
 
 def lane0_if(stmt: Stmt) -> Stmt:
     return IfStmt(BinaryOp("==", LaneId, 0), stmt)
 
-def pipeline_select(qidx: ExprLike, cases: Sequence[Stmt], default: Optional[Stmt] = None) -> Stmt:
-    if not cases:
-        return default or NoStmt()
-    chain: Stmt = cases[0]
-    for idx, stmt in enumerate(cases[1:], start=1):
-        chain = IfStmt(BinaryOp("==", qidx, idx), stmt, chain)
-    if default is None:
-        return chain
-    return IfStmt(BinaryOp(">=", qidx, len(cases)), default, chain)
+
 
 class KernelGlobals:
     def __init__(self, **vars_by_name):
@@ -252,41 +204,7 @@ class KernelGlobals:
 
     def var(self, name: str) -> Var:
         return self._var_map[name]
-
-
-def kernel_prelude(
-    block_size: int,
-    qsize: int,
-    g: KernelGlobals,
-    row: Var,
-    col: Var,
-    tiles: Sequence[Tile],
-    queues: Sequence[TileQueue],
-    num_tiles: Var,
-    warpid: Var,
-    warpgroupid: Var,
-    num_consumers: Var,
-    qsize_sym: Optional[ExprLike] = None,
-) -> SeqStmt:
-    return SeqStmt([
-        RawStmt(f"static constexpr int BLOCK_SIZE = {block_size};"),
-        RawStmt(f"static constexpr int QSIZE = {qsize};"),
-        RawStmt("static constexpr int NUM_THREADS = 8 * kittens::WARP_THREADS;"),
-        RawStmt("extern __shared__ alignment_dummy __shm[];"),
-        RawStmt("shared_allocator al((int*)&__shm[0]);"),
-        DeclStmt(row, BlockIdx.y),
-        DeclStmt(col, BlockIdx.x),
-        DeclStmt(num_tiles, f"({g}.N + BLOCK_SIZE - 1) / BLOCK_SIZE"),
-        DeclStmt(warpid, WarpId),
-        DeclStmt(warpgroupid, WarpGroupId),
-        DeclStmt(num_consumers, "(NUM_THREADS / 128) - 1"),
-        *[t.def_() for t in tiles],
-        *[q.declare_semaphores() for q in queues],
-        IfStmt(BinaryOp("==", ThreadIdx.x, 0),
-               SeqStmt([q.init_semaphores(0, "num_consumers") for q in queues])),
-        RawStmt("__syncthreads();"),
-    ])
-
+        
 class Tile:
     def __init__(
         self,
@@ -335,88 +253,21 @@ class Tile:
             RawStmt(f"init_semaphore({self.empty_sem}, {empty_init}, 0);"),
         ])
 
-    def produce(
-        self,
-        src: ExprLike,
-        coord: ExprLike,
-        phase: Optional[ExprLike] = None,
-        expect_bytes: Optional[ExprLike] = None,
-        callee: str = "tma::load_async",
-    ) -> Stmt:
-        if not self.use_semaphores:
-            return ExprStmt(TMALoadOp(self.name, src, coord, None, callee=callee))
-        seq: list[Stmt] = []
-        if phase is not None:
-            seq.append(ExprStmt(WaitOp(self.empty_sem, phase)))
-        if expect_bytes is None:
-            expect_bytes = SizeBytesOfTypeOf(self.name)
-        if expect_bytes is not None:
-            seq.append(ExprStmt(ExpectBytesOp(self.full_sem, expect_bytes)))
-        seq.append(ExprStmt(TMALoadOp(self.name, src, coord, self.full_sem, callee=callee)))
-        return SeqStmt(seq)
+    def wait_empty(self) -> Stmt:
+        return ExprStmt(WaitOp(self.empty_sem))
 
-    def consume(
-        self,
-        phase: Optional[ExprLike],
-        body: Stmt,
-        arrive: bool = True,
-        arrive_count: ExprLike = 1,
-    ) -> Stmt:
-        if not self.use_semaphores:
-            return body
-        seq: list[Stmt] = []
-        if phase is not None:
-            seq.append(ExprStmt(WaitOp(self.full_sem, phase)))
-        seq.append(body)
-        if arrive:
-            seq.append(ExprStmt(ArriveOp(self.empty_sem, arrive_count)))
-        return SeqStmt(seq)
+    def wait_full(self) -> Stmt:
+        return ExprStmt(WaitOp(self.full_sem))
 
-class TileQueue:
-    def __init__(self, name: str, tiles: Sequence[Tile], full_sem: Optional[str] = None, empty_sem: Optional[str] = None):
-        self.name = name
-        self.tiles = tiles
-        self.full_sem = full_sem or f"full_{name}"
-        self.empty_sem = empty_sem or f"empty_{name}"
-        for t in self.tiles:
-            t.full_sem = self.full_sem
-            t.empty_sem = self.empty_sem
+    def arrive_empty(self) -> Stmt:
+        return lane0_if(ExprStmt(ArriveOp(self.empty_sem, 1)))
 
-    def declare_semaphores(self, shared: bool = True) -> Stmt:
-        prefix = "__shared__ " if shared else ""
-        return RawStmt(f"{prefix}semaphore {self.full_sem}, {self.empty_sem};")
+    def arrive_full(self) -> Stmt:
+        return lane0_if(ExprStmt(ArriveOp(self.full_sem, 1)))
 
-    def init_semaphores(self, full_init: Union[str, int], empty_init: Union[str, int]) -> Stmt:
-        return SeqStmt([
-            RawStmt(f"init_semaphore({self.full_sem}, {full_init}, 1);"),
-            RawStmt(f"init_semaphore({self.empty_sem}, {empty_init}, 0);"),
-        ])
+    def expect_bytes(self) -> Stmt:
+        return lane0_if(ExprStmt(ExpectBytesOp(self.full_sem, SizeBytesOfTypeOf(self.name))))
 
-    def produce(
-        self,
-        loads: Sequence[tuple[Tile, ExprLike, ExprLike]],
-        phase: ExprLike,
-        expect_bytes: Optional[ExprLike] = None,
-    ) -> Stmt:
-        if expect_bytes is None:
-            sizes = [SizeBytesOfTypeOf(t.name) for t, _, _ in loads]
-            if sizes:
-                total: ExprLike = sizes[0]
-                for s in sizes[1:]:
-                    total = BinaryOp("+", total, s)
-                expect_bytes = total
-        seq: list[Stmt] = [ExprStmt(WaitOp(self.empty_sem, phase))]
-        if expect_bytes is not None:
-            seq.append(ExprStmt(ExpectBytesOp(self.full_sem, expect_bytes)))
-        for t, src, coord in loads:
-            seq.append(ExprStmt(TMALoadOp(t.name, src, coord, self.full_sem)))
-        return SeqStmt(seq)
-
-    def consume(self, phase: ExprLike, body: Stmt, arrive: bool = True, arrive_count: ExprLike = 1) -> Stmt:
-        seq: list[Stmt] = [ExprStmt(WaitOp(self.full_sem, phase)), body]
-        if arrive:
-            seq.append(ExprStmt(ArriveOp(self.empty_sem, arrive_count)))
-        return SeqStmt(seq)
 
 KITTENS_TEMPLATE = """
 #include <iostream>

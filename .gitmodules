@@ -1,0 +1,4 @@
+[submodule "thunderkittens"]
+	path = thunderkittens
+	url = https://github.com/HazyResearch/thunderkittens
+	branch = main

@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+tests/test_harness.py
+warpir/__init__.py
+warpir/compiler.py
+warpir/flow.py
+warpir/format.py
+warpir/layouts.py
+warpir/main.py
+warpir/ops.py
+warpir.egg-info/PKG-INFO
+warpir.egg-info/SOURCES.txt
+warpir.egg-info/dependency_links.txt
+warpir.egg-info/requires.txt
+warpir.egg-info/top_level.txt

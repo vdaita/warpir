@@ -5,21 +5,56 @@ from .layouts import SharedTileType, RegTileType
 class Expr(Protocol):
     def __str__(self) -> str: ...
 
-ExprLike = Union["Expr", str, int, float]
+class ExprBase:
+    def __add__(self, other):
+        return BinaryOp("+", self, other)
+    def __radd__(self, other):
+        return BinaryOp("+", other, self)
+    def __sub__(self, other):
+        return BinaryOp("-", self, other)
+    def __rsub__(self, other):
+        return BinaryOp("-", other, self)
+    def __mul__(self, other):
+        return BinaryOp("*", self, other)
+    def __rmul__(self, other):
+        return BinaryOp("*", other, self)
+    def __div__(self, other):
+        return BinaryOp("/", self, other)
+    def __truediv__(self, other):
+        return BinaryOp("/", self, other)
+    def __mod__(self, other):
+        return BinaryOp("%", self, other)
+    def __lt__(self, other):
+        return BinaryOp("<", self, other)
+    def __le__(self, other):
+        return BinaryOp("<=", self, other)
+    def __gt__(self, other):
+        return BinaryOp(">", self, other)
+    def __ge__(self, other):
+        return BinaryOp(">=", self, other)
+    def __eq__(self, other):
+        return BinaryOp("==", self, other)
+    def __ne__(self, other):
+        return BinaryOp("!=", self, other)
+
+ExprLike = Union[ExprBase, "Expr", str, int, float]
 
 def _fmt(value: ExprLike) -> str:
     return str(value)
 
 _INFIX_OPS = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "==", "!=", "<", ">", "<=", ">="}
 
-class BuiltinExpr:
+class BuiltinExpr(ExprBase):
     def __init__(self, text: str):
         self.text = text
 
     def __str__(self) -> str:
         return self.text
 
-class Symbol:
+def getConst(name: str):
+    return BuiltinExpr(name)
+
+class Symbol(ExprBase):
     def __init__(self, name: str):
         self.name = name
 
@@ -29,13 +64,25 @@ class Symbol:
     def __str__(self) -> str:
         return self.name
 
-class FieldRef:
+class FieldRef(ExprBase):
     def __init__(self, base, field: str):
         self.base = base
         self.field = field
 
     def __str__(self) -> str:
         return f"{_fmt(self.base)}.{self.field}"
+
+    def load(self, dst, coord):
+        from .flow import ExprStmt
+        return ExprStmt(TMALoadOp(dst, self, coord, callee="tma::load_async"))
+
+    def load_async(self, dst, coord, semaphore=None):
+        from .flow import ExprStmt, lane0_if
+        return lane0_if(ExprStmt(TMALoadOp(dst, self, coord, semaphore, callee="tma::load_async")))
+
+    def store(self, src, coord):
+        from .flow import ExprStmt
+        return ExprStmt(TMAStoreOp(self, src, coord, callee="tma::store_async"))
 
 class Coord:
     def __init__(self, *items):
@@ -82,7 +129,7 @@ class UnaryOp:
     def __str__(self) -> str:
         return f"{self.op}({_fmt(self.arg)})"
 
-class BinaryOp:
+class BinaryOp(ExprBase):
     def __init__(self, op: str, lhs: ExprLike, rhs: ExprLike):
         self.op = op
         self.lhs = lhs
@@ -165,12 +212,14 @@ class TMAStoreOp:
         return f"{self.callee}({_fmt(self.dst)}, {_fmt(self.src)}, {_fmt(self.coord)}, {_fmt(self.semaphore)})"
 
 class WaitOp:
-    def __init__(self, sem: ExprLike, phase: ExprLike, callee: str = "wait"):
+    def __init__(self, sem: ExprLike, phase: Optional[ExprLike] = None, callee: str = "wait"):
         self.callee = callee
         self.sem = sem
         self.phase = phase
 
     def __str__(self) -> str:
+        if self.phase is None:
+            return f"{self.callee}({_fmt(self.sem)})"
         return f"{self.callee}({_fmt(self.sem)}, {_fmt(self.phase)})"
 
 class ArriveOp:
@@ -197,3 +246,13 @@ class MMAWaitOp:
 
     def __str__(self) -> str:
         return f"{self.callee}()"
+
+class OpCallExpr(ExprBase):
+    def __init__(self, callee: str, *args: ExprLike):
+        self.callee = callee
+        self.args = args
+
+    def __str__(self) -> str:
+        args_str = ", ".join(_fmt(arg) for arg in self.args)
+        return f"{self.callee}({args_str})"
+
