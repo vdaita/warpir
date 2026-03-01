@@ -22,6 +22,10 @@ WRAPPER_TEMPLATE = """
 void launch_kernel(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
     TORCH_CHECK(A.is_cuda(), "Tensors must be on CUDA");
     TORCH_CHECK(A.dtype() == torch::kBFloat16, "Tensors must be bfloat16");
+    TORCH_CHECK(B.is_cuda(), "Tensors must be on CUDA");
+    TORCH_CHECK(B.dtype() == torch::kBFloat16, "Tensors must be bfloat16");
+    TORCH_CHECK(C.is_cuda(), "Tensors must be on CUDA");
+    TORCH_CHECK(C.dtype() == torch::kBFloat16, "Tensors must be bfloat16");
     
     int N = A.size(0);
     int BLOCK_SIZE = 64;
@@ -114,7 +118,6 @@ def generate_and_test(name, program):
         print(e)
         
 if __name__ == "__main__":
-    import shutil
     
     # Clean previous torch extensions lockfile to avoid ninja stuck errors
     if os.path.exists("outputs/lock"):
