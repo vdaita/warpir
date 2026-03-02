@@ -2,3 +2,6 @@
 warpir/__pycache__
 warpir.egg-infooutputs/
 __pycache__/
+
+*.ninja
+outputs/

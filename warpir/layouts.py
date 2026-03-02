@@ -21,10 +21,12 @@ class SharedTileType:
         self.tile_h = tile_h
         self.layout = layout
     def __str__(self):
+        # Current ThunderKittens st_* aliases do not take a layout template arg.
+        # Keep layout on the Python side for API compatibility, but do not emit it.
         if self.data_type == GPUType.bf16:
-            return f"st_bf<{self.tile_w}, {self.tile_h}, {self.layout}>"
+            return f"st_bf<{self.tile_w}, {self.tile_h}>"
         else:
-            return f"st_fl<{self.tile_w}, {self.tile_h}, {self.layout}>"
+            return f"st_fl<{self.tile_w}, {self.tile_h}>"
 
 class SharedVecType:
     def __init__(self, data_type: GPUType, length: int):
@@ -46,7 +48,8 @@ class GlobalType:
         self.height_dim = height_dim
         self.width_dim = width_dim
     def __str__(self):
-        return f"gl<{self.data_type}, {self.batch_dim}, {self.depth_dim}, {self.height_dim}, {self.width_dim}, {self.sub_tile}>"
+        data_type = self.data_type.value if isinstance(self.data_type, Enum) else self.data_type
+        return f"gl<{data_type}, {self.batch_dim}, {self.depth_dim}, {self.height_dim}, {self.width_dim}, {self.sub_tile}>"
 
 class RegTileType:
     def __init__(self, data_type: GPUType, tile_w: int, tile_h: int, layout: RegTileLayout):
@@ -55,10 +58,11 @@ class RegTileType:
         self.tile_h = tile_h
         self.layout = layout
     def __str__(self):
+        layout = self.layout.value if isinstance(self.layout, Enum) else self.layout
         if self.data_type == GPUType.bf16:
-            return f"rt_bf<{self.tile_w}, {self.tile_h}, {self.layout}>"
+            return f"rt_bf<{self.tile_w}, {self.tile_h}, {layout}>"
         else:
-            return f"rt_fl<{self.tile_w}, {self.tile_h}, {self.layout}>"
+            return f"rt_fl<{self.tile_w}, {self.tile_h}, {layout}>"
 
 class RegVecType:
     def __init__(self, data_type: GPUType, length: int):

@@ -4,7 +4,18 @@ import torch
 from torch.utils.cpp_extension import load
 from time import time
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# so warpir is in python path
+sys.path.append(
+  os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))))
+
+# for including kittens.cuh in kernel compilation
+THUNDERKITTENS_INCLUDE_PATH = os.path.join(
+  os.path.dirname(
+    os.path.dirname(
+      os.path.dirname(
+        os.path.abspath(__file__)))),
+  "ThunderKittens", "include")
 
 from warpir.compiler import emit_cpp
 from tests.gemm_baseline import build_gemm_kernel as build_baseline
@@ -17,6 +28,10 @@ WRAPPER_TEMPLATE = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#ifndef cudaLaunchAttributePreferredClusterDimension
+#define cudaLaunchAttributePreferredClusterDimension cudaLaunchAttributeClusterDimension
+#endif
+
 {kernel_code}
 
 void launch_kernel(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
@@ -27,12 +42,12 @@ void launch_kernel(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
     TORCH_CHECK(C.is_cuda(), "Tensors must be on CUDA");
     TORCH_CHECK(C.dtype() == torch::kBFloat16, "Tensors must be bfloat16");
     
-    int N = A.size(0);
+    size_t N = A.size(0);
     int BLOCK_SIZE = 64;
     int NUM_WORKERS = 8;
     int NUM_THREADS = (NUM_WORKERS * 32); 
     
-    using a_gl = gl<bf16, -1, -1, -1, -1, st_bf<64, 64, ducks::st_layout::row>>;
+    using a_gl = gl<bf16, 1, 1, -1, -1, st_bf<64, 64>>;
     a_gl a_arg{{reinterpret_cast<bf16*>(A.data_ptr<at::BFloat16>()), nullptr, nullptr, N, N}};
     a_gl b_arg{{reinterpret_cast<bf16*>(B.data_ptr<at::BFloat16>()), nullptr, nullptr, N, N}};
     a_gl c_arg{{reinterpret_cast<bf16*>(C.data_ptr<at::BFloat16>()), nullptr, nullptr, N, N}};
@@ -90,9 +105,9 @@ def generate_and_test(name, program):
         ext = load(
             name=name,
             sources=[out_file],
-            extra_include_paths=["thunderkittens/include"],
+            extra_include_paths=[THUNDERKITTENS_INCLUDE_PATH],
             extra_cflags=["-O3", "-std=c++20"],
-            extra_cuda_cflags=["-O3", "-std=c++20", "--use_fast_math", "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__"],
+            extra_cuda_cflags=["-O3", "-std=c++20", "--use_fast_math", "--extended-lambda", "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__"],
             build_directory="outputs",
             verbose=False
         )

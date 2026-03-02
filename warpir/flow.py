@@ -285,6 +285,8 @@ struct kernel_globals {
 };
 
 __global__ void kernel(const __grid_constant__ kernel_globals g) {
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
     {{ kernel_stmt }}
 }
 """
