@@ -17,12 +17,15 @@ THUNDERKITTENS_INCLUDE_PATH = os.path.join(
         os.path.abspath(__file__)))),
   "ThunderKittens", "include")
 
+OUTPUT_DIR = os.path.join(
+  os.path.dirname(os.path.abspath(__file__)),
+  "outputs"
+)
+
 from warpir.compiler import emit_cpp
 from tests.gemm_baseline import build_gemm_kernel as build_baseline
 from tests.gemm_pipelined import build_gemm_kernel as build_pipelined
 from tests.gemm_warp_specialized import build_gemm_kernel as build_warp_specialized
-
-os.makedirs("outputs", exist_ok=True)
 
 WRAPPER_TEMPLATE = """
 #include <torch/extension.h>
@@ -74,10 +77,9 @@ def generate_and_test(name, program):
     kernel_code = emit_cpp(program)
     full_code = WRAPPER_TEMPLATE.format(kernel_code=kernel_code)
     
-    out_file = f"outputs/{name}.cu"
+    out_file = f"{OUTPUT_DIR}/{name}.cu"
     
-    # Caching / Writing
-    os.makedirs("outputs", exist_ok=True)
+    # 2. Cache/write the CUDA code
     if os.path.exists(out_file):
         with open(out_file, "r") as f:
             existing = f.read()
@@ -121,7 +123,7 @@ def generate_and_test(name, program):
         print(f"[{name}] GPU Execution time: {(t1 - t0) * 1000:.2f}ms")
     else:
         print(f"[{name}] No CUDA device found. Logically stepping through tile coordinate maths in python simulation...")
-        exit()
+        return
     # Reference comparison
     torch_out = torch.matmul(A.float(), B.float()).to(torch.bfloat16)
     
@@ -137,6 +139,8 @@ if __name__ == "__main__":
     # Clean previous torch extensions lockfile to avoid ninja stuck errors
     if os.path.exists("outputs/lock"):
         os.remove("outputs/lock")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     generate_and_test("gemm_baseline", build_baseline())
     generate_and_test("gemm_pipelined", build_pipelined())
