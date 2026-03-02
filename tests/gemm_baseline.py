@@ -1,23 +1,39 @@
 from warpir import *
+from warpir.ops import BuiltinExpr
 
 def build_gemm_kernel() -> Program:
-    block_size = 32
-    ab_type = SharedTileType(GPUType.bf16, block_size, block_size, SharedTileLayout.row_major)
-    # Output accumulates locally to a float tile
-    accum_type = RegTileType(GPUType.fp32, block_size, block_size, RegTileLayout.row_major)
+    block_size_val = 32
+    BLOCK_SIZE = BuiltinExpr("BLOCK_SIZE")
     
-    # Global types have depth=1, height=1
-    g = KernelGlobals(A=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1), 
-                      B=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1),
-                      C=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1), 
-                      N=ScalarType("int"))
+    constants = f"""
+static constexpr int BLOCK_SIZE = {block_size_val};
+static constexpr int NUM_WORKERS =  (1);
+static constexpr int NUM_THREADS = (NUM_WORKERS*kittens::WARP_THREADS);
+"""
+
+    # Define types with programmatic aliases
+    sub_tile = SharedTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE, SharedTileLayout.row_major, alias_name="sub_tile")
+    tile_gl = GlobalType(GPUType.bf16, sub_tile, w=1, x=1, y=-1, z=-1, alias_name="tile_gl")
+
+    # Use aliases in KernelGlobals
+    g = KernelGlobals(
+        name="matmul_globals",
+        A=tile_gl,
+        B=tile_gl,
+        C=tile_gl,
+        N=ScalarType("int")
+    )
+    
+    ab_type = sub_tile
+    # Output accumulates locally to a float tile
+    accum_type = RegTileType(GPUType.fp32, BLOCK_SIZE, BLOCK_SIZE, RegTileLayout.row_major)
     
     As = Tile("As", ab_type)
     Bs = Tile("Bs", ab_type)
     
-    A_reg = Tile("A_reg", RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.row_major))
-    B_reg = Tile("B_reg", RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.row_major))
-    B_reg_col = Tile("B_reg_col", RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.col_major))
+    A_reg = Tile("A_reg", RegTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE, RegTileLayout.row_major))
+    B_reg = Tile("B_reg", RegTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE, RegTileLayout.row_major))
+    B_reg_col = Tile("B_reg_col", RegTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE, RegTileLayout.col_major))
     
     C_accum = Tile("C_accum", accum_type)
 
@@ -43,21 +59,51 @@ def build_gemm_kernel() -> Program:
     )
     store_stmt = OpCall("kittens::warp::store", g.C, C_accum, Coord(0, 0, row, col))
 
-    return Program(input_vars=[], kernel_vars=g, kernel_stmt=SeqStmt([
-        As.def_(),
-        Bs.def_(),
-        A_reg.def_(),
-        B_reg.def_(),
-        B_reg_col.def_(),
-        C_accum.def_(),
-        DeclStmt(col, getConst("blockIdx.x")),
-        DeclStmt(row, getConst("blockIdx.y")),
-        OpCall("kittens::warp::zero", C_accum),
-        DeclStmt(num_tiles, (g.N + block_size - 1) / block_size),
-        DeclStmt(tile),
-        for_stmt,
-        store_stmt
-    ]))
+    launch_code = """
+// launch kernel
+void matmul(bf16* A, bf16* B, bf16* C, size_t N) { 
+
+    // global pointers
+    using a_gl = matmul_globals::tile_gl;
+    using b_gl = matmul_globals::tile_gl; 
+    using c_gl = matmul_globals::tile_gl;
+    a_gl  a_arg{A, nullptr, nullptr, (int)N, (int)N};
+    b_gl  b_arg{B, nullptr, nullptr, (int)N, (int)N};
+    c_gl  c_arg{C, nullptr, nullptr, (int)N, (int)N};
+    matmul_globals g{a_arg, b_arg, c_arg, (int)N}; 
+
+    // launch
+    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);  // Watch out for requesting too many!
+    unsigned long mem_size = 100000;
+    cudaDeviceSynchronize();
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    kernel<<<blocks, NUM_THREADS, mem_size>>>(g);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    cudaDeviceSynchronize();
+}
+"""
+
+    return Program(
+        input_vars=[], 
+        kernel_vars=g, 
+        kernel_stmt=SeqStmt([
+            As.def_(),
+            Bs.def_(),
+            A_reg.def_(),
+            B_reg.def_(),
+            B_reg_col.def_(),
+            C_accum.def_(),
+            DeclStmt(col, getConst("blockIdx.x")),
+            DeclStmt(row, getConst("blockIdx.y")),
+            OpCall("kittens::warp::zero", C_accum),
+            DeclStmt(num_tiles, (g.N + BLOCK_SIZE - 1) / BLOCK_SIZE),
+            DeclStmt(tile),
+            for_stmt,
+            store_stmt
+        ]),
+        constants=constants,
+        launch_code=launch_code
+    )
 
 if __name__ == "__main__":
     print(emit_cpp(build_gemm_kernel()))

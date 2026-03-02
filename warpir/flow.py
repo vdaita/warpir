@@ -120,7 +120,7 @@ class SharedAllocStmt(Stmt):
 
     def __str__(self) -> str:
         if self.count is None:
-            tmpl = _ENV.from_string("{{ type }} (&{{ name }}) = {{ alloc }}.allocate<{{ type }}>();")
+            tmpl = _ENV.from_string("{{ type }} &{{ name }} = {{ alloc }}.allocate<{{ type }}>();")
             return tmpl.render(type=self.tile_type, name=self.name, alloc=self.allocator)
         tmpl = _ENV.from_string(
             "{{ type }} (&{{ name }})[{{ count }}] = {{ alloc }}.allocate<{{ type }}, {{ count }}>();"
@@ -182,10 +182,28 @@ def lane0_if(stmt: Stmt) -> Stmt:
 
 
 class KernelGlobals:
-    def __init__(self, **vars_by_name):
+    def __init__(self, name: str = "matmul_globals", **vars_by_name):
+        self.name = name
         self._vars = [Var(name, vtype) for name, vtype in vars_by_name.items()]
         self._var_map = {v.name: v for v in self._vars}
         self._sym = Symbol("g")
+        
+        # Programmatically collect aliases
+        self.aliases = []
+        seen_aliases = set()
+        for v in self._vars:
+            vtype = v.var_type
+            if hasattr(vtype, 'alias_name') and vtype.alias_name:
+                if vtype.alias_name not in seen_aliases:
+                    # If it's a GlobalType, it might depend on a sub_tile alias
+                    if hasattr(vtype, 'sub_tile') and hasattr(vtype.sub_tile, 'alias_name') and vtype.sub_tile.alias_name:
+                        st = vtype.sub_tile
+                        if st.alias_name not in seen_aliases:
+                            self.aliases.append(f"using {st.alias_name} = {st.emit_type()};")
+                            seen_aliases.add(st.alias_name)
+                    
+                    self.aliases.append(f"using {vtype.alias_name} = {vtype.emit_type()};")
+                    seen_aliases.add(vtype.alias_name)
 
     @property
     def vars(self) -> Sequence[Var]:
@@ -278,31 +296,48 @@ KITTENS_TEMPLATE = """
 
 using namespace kittens;
 
-struct kernel_globals {
+{{ constants }}
+
+struct {{ globals_name }} {
+    {%- for alias in aliases %}
+    {{ alias }}
+    {%- endfor %}
     {%- for var in kernel_vars %}
     {{ var.define() }}
     {%- endfor %}
 };
 
-__global__ void kernel(const __grid_constant__ kernel_globals g) {
+__global__ void kernel(const __grid_constant__ {{ globals_name }} g) {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
     {{ kernel_stmt }}
 }
+
+{{ launch_code }}
 """
 class Program:
-    def __init__(self, input_vars: Sequence[Var], kernel_vars, kernel_stmt: Stmt):
+    def __init__(self, input_vars: Sequence[Var], kernel_vars, kernel_stmt: Stmt, constants: str = "", launch_code: str = ""):
         self.input_vars = input_vars
         self.kernel_vars = kernel_vars
         self.kernel_stmt = kernel_stmt
+        self.constants = constants
+        self.launch_code = launch_code
     
     def __str__(self):
         if isinstance(self.kernel_vars, KernelGlobals):
             kernel_vars = self.kernel_vars.vars
+            aliases = self.kernel_vars.aliases
+            globals_name = self.kernel_vars.name
         else:
             kernel_vars = self.kernel_vars
+            aliases = []
+            globals_name = "kernel_globals"
         t = _ENV.from_string(KITTENS_TEMPLATE)
         return t.render(
+            constants=self.constants,
+            globals_name=globals_name,
+            aliases=aliases,
             kernel_vars=kernel_vars,
-            kernel_stmt=self.kernel_stmt
+            kernel_stmt=self.kernel_stmt,
+            launch_code=self.launch_code
         )

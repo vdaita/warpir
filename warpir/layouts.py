@@ -15,14 +15,16 @@ class SharedTileLayout(str, Enum):
     col_major = "ducks::st_layout::col"
 
 class SharedTileType:
-    def __init__(self, data_type: GPUType, tile_w: int, tile_h: int, layout: SharedTileLayout):
+    def __init__(self, data_type: GPUType, tile_w: int, tile_h: int, layout: SharedTileLayout, alias_name: Optional[str] = None):
         self.data_type = data_type
         self.tile_w = tile_w
         self.tile_h = tile_h
         self.layout = layout
+        self.alias_name = alias_name
     def __str__(self):
-        # Current ThunderKittens st_* aliases do not take a layout template arg.
-        # Keep layout on the Python side for API compatibility, but do not emit it.
+        if self.alias_name:
+            return self.alias_name
+    def emit_type(self):
         if self.data_type == GPUType.bf16:
             return f"st_bf<{self.tile_w}, {self.tile_h}>"
         else:
@@ -39,17 +41,22 @@ class SharedVecType:
         return f"sv_fl<{self.length}>"
 
 class GlobalType:
-    def __init__(self, data_type: GPUType, sub_tile: SharedTileType, batch_dim: Optional[int] = -1, depth_dim: Optional[int] = -1, height_dim: Optional[int] = -1, width_dim: Optional[int] = -1):
+    def __init__(self, data_type: GPUType, sub_tile: Union[SharedTileType, str], w: int = -1, x: int = -1, y: int = -1, z: int = -1, alias_name: Optional[str] = None):
         self.data_type = data_type
         self.sub_tile = sub_tile
-    
-        self.batch_dim = batch_dim
-        self.depth_dim = depth_dim
-        self.height_dim = height_dim
-        self.width_dim = width_dim
+        self.w = w
+        self.x = x
+        self.y = y
+        self.z = z
+        self.alias_name = alias_name
     def __str__(self):
+        if self.alias_name:
+            return self.alias_name
         data_type = self.data_type.value if isinstance(self.data_type, Enum) else self.data_type
-        return f"gl<{data_type}, {self.batch_dim}, {self.depth_dim}, {self.height_dim}, {self.width_dim}, {self.sub_tile}>"
+        return f"gl<{data_type}, {self.w}, {self.x}, {self.y}, {self.z}, {self.sub_tile}>"
+    def emit_type(self):
+        data_type = self.data_type.value if isinstance(self.data_type, Enum) else self.data_type
+        return f"gl<{data_type}, {self.w}, {self.x}, {self.y}, {self.z}, {self.sub_tile}>"
 
 class RegTileType:
     def __init__(self, data_type: GPUType, tile_w: int, tile_h: int, layout: RegTileLayout):
