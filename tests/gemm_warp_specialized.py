@@ -103,7 +103,16 @@ static constexpr int BLOCK_SIZE = {block_size_val};
         # Instead of generic dispatch, use an If/Else for warp specialised struct
         IfStmt(BuiltinExpr("warpgroupid == 0"), producer, consumer)
     ])
-    return Program(input_vars=[], kernel_vars=g, kernel_stmt=kernel_stmt, constants=constants)
+    return Program(
+        input_vars=[Var("A", ScalarType("bf16*")), Var("B", ScalarType("bf16*")), Var("C", ScalarType("bf16*")), Var("N", ScalarType("size_t"))], 
+        kernel_vars=g, 
+        kernel_stmt=kernel_stmt, 
+        constants=constants,
+        grid_dims="(N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE",
+        block_dims="NUM_THREADS",
+        shared_mem="102400",
+        launch_name="matmul"
+    )
 
 if __name__ == "__main__":
     print(emit_cpp(build_gemm_kernel()))

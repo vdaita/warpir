@@ -25,55 +25,11 @@ from tests.gemm_baseline import build_gemm_kernel as build_baseline
 from tests.gemm_pipelined import build_gemm_kernel as build_pipelined
 from tests.gemm_warp_specialized import build_gemm_kernel as build_warp_specialized
 
-WRAPPER_TEMPLATE = """
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-
-#ifndef cudaLaunchAttributePreferredClusterDimension
-#define cudaLaunchAttributePreferredClusterDimension cudaLaunchAttributeClusterDimension
-#endif
-
-{kernel_code}
-
-void launch_kernel(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
-    TORCH_CHECK(A.is_cuda(), "Tensors must be on CUDA");
-    TORCH_CHECK(A.dtype() == torch::kBFloat16, "Tensors must be bfloat16");
-    TORCH_CHECK(B.is_cuda(), "Tensors must be on CUDA");
-    TORCH_CHECK(B.dtype() == torch::kBFloat16, "Tensors must be bfloat16");
-    TORCH_CHECK(C.is_cuda(), "Tensors must be on CUDA");
-    TORCH_CHECK(C.dtype() == torch::kBFloat16, "Tensors must be bfloat16");
-    
-    size_t N = A.size(0);
-    int BLOCK_SIZE = 64;
-    int NUM_WORKERS = 4;
-    int NUM_THREADS = (NUM_WORKERS * 32); 
-    
-    using a_gl = gl<bf16, -1, -1, -1, -1, st_bf<64, 64>>;
-    a_gl a_arg{{reinterpret_cast<bf16*>(A.data_ptr<at::BFloat16>()), 1, 1, N, N}};
-    a_gl b_arg{{reinterpret_cast<bf16*>(B.data_ptr<at::BFloat16>()), 1, 1, N, N}};
-    a_gl c_arg{{reinterpret_cast<bf16*>(C.data_ptr<at::BFloat16>()), 1, 1, N, N}};
-    
-    kernel_globals g{{a_arg, b_arg, c_arg, N}};
-    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    unsigned long mem_size = 102400; // 100KB+ shared memory allowance
-    
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    kernel<<<blocks, NUM_THREADS, mem_size>>>(g);
-    
-    AT_CUDA_CHECK(cudaGetLastError());
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-}}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-  m.def("launch", &launch_kernel, "PyTorch wrapper for generated kernel");
-}}
-"""
 def generate_and_test(name, program):
-    print(f"\\n--- Processing: {name} ---")
+    print(f"\n--- Processing: {name} ---")
     
-    # 1. Generate CUDA code
-    kernel_code = emit_cpp(program)
-    full_code = WRAPPER_TEMPLATE.format(kernel_code=kernel_code)
+    # 1. Generate CUDA code (now includes PyTorch scaffolding)
+    full_code = emit_cpp(program)
     
     out_file = f"{OUTPUT_DIR}/{name}.cu"
     

@@ -292,9 +292,15 @@ KITTENS_TEMPLATE = """
 #include <random>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "kittens.cuh"
 
 using namespace kittens;
+
+#ifndef cudaLaunchAttributePreferredClusterDimension
+#define cudaLaunchAttributePreferredClusterDimension cudaLaunchAttributeClusterDimension
+#endif
 
 {{ constants }}
 
@@ -316,12 +322,19 @@ __global__ void kernel(const __grid_constant__ {{ globals_name }} g) {
 {{ launch_code }}
 """
 class Program:
-    def __init__(self, input_vars: Sequence[Var], kernel_vars, kernel_stmt: Stmt, constants: str = "", launch_code: str = ""):
+    def __init__(self, input_vars: Sequence[Var], kernel_vars: KernelGlobals, kernel_stmt: Stmt, 
+                 constants: str = "", launch_code: Optional[str] = None,
+                 grid_dims: Optional[ExprLike] = None, block_dims: Optional[ExprLike] = None,
+                 shared_mem: Optional[ExprLike] = None, launch_name: str = "launch"):
         self.input_vars = input_vars
         self.kernel_vars = kernel_vars
         self.kernel_stmt = kernel_stmt
         self.constants = constants
         self.launch_code = launch_code
+        self.grid_dims = grid_dims
+        self.block_dims = block_dims
+        self.shared_mem = shared_mem
+        self.launch_name = launch_name
     
     def __str__(self):
         if isinstance(self.kernel_vars, KernelGlobals):
@@ -333,11 +346,79 @@ class Program:
             aliases = []
             globals_name = "kernel_globals"
         t = _ENV.from_string(KITTENS_TEMPLATE)
+        
+        launch_code = self.launch_code
+        if launch_code is None:
+            # Automate launch code generation
+            # We assume a standard signature for now: Tensor A, Tensor B, Tensor C, size_t N
+            # But we can generalize by looking at input_vars
+            
+            torch_args = []
+            call_args = []
+            check_lines = []
+            init_lines = []
+            
+            for v in self.input_vars:
+                if "bf16*" in str(v.var_type):
+                    torch_args.append(f"torch::Tensor {v.name}")
+                    check_lines.append(f'  TORCH_CHECK({v.name}.is_cuda(), "Tensor {v.name} must be on CUDA");')
+                    check_lines.append(f"  TORCH_CHECK({v.name}.dtype() == torch::kBFloat16, \"Tensor {v.name} must be bfloat16\");")
+                    call_args.append(f"reinterpret_cast<bf16*>({v.name}.data_ptr<at::BFloat16>())")
+                else:
+                    torch_args.append(f"{v.var_type} {v.name}")
+                    call_args.append(v.name)
+            
+            # Host-side matmul internal launch wrapper (the one that sets up globals)
+            internal_args = ", ".join([f"{v.var_type} {v.name}" for v in self.input_vars])
+            
+            for v in self.kernel_vars.vars:
+                if v.name in [iv.name for iv in self.input_vars]:
+                    from .layouts import GlobalType
+                    vtype = v.var_type
+                    if isinstance(vtype, GlobalType) or (isinstance(vtype, str) and "gl" in vtype) or (hasattr(vtype, 'alias_name') and vtype.alias_name and "gl" in str(vtype)):
+                        N_vars = [iv.name for iv in self.input_vars if iv.name == 'N']
+                        dim_val = f"(int){N_vars[0]}" if N_vars else "-1"
+                        type_str = vtype.alias_name if hasattr(vtype, 'alias_name') and vtype.alias_name else str(vtype)
+                        init_lines.append(f"  using {v.name}_t = {globals_name}::{type_str};")
+                        init_lines.append(f"  {v.name}_t {v.name}_arg{{{v.name}, nullptr, nullptr, {dim_val}, {dim_val}}};")
+                    else:
+                        init_lines.append(f"  {v.var_type} {v.name}_arg = {v.name};")
+
+            g_init = ", ".join([f"{v.name}_arg" for v in self.kernel_vars.vars])
+            grid = str(self.grid_dims) if self.grid_dims else "1"
+            block = str(self.block_dims) if self.block_dims else "1"
+            shm = str(self.shared_mem) if self.shared_mem else "0"
+            
+            launch_code = f"""
+void {self.launch_name}_internal({internal_args}) {{
+{chr(10).join(init_lines)}
+  {globals_name} g{{{g_init}}};
+  dim3 grid{{{grid}}};
+  dim3 block{{{block}}};
+  unsigned long mem_size = {shm};
+  if (mem_size > 0) {{
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+  }}
+  kernel<<<grid, block, mem_size>>>(g);
+  CHECK_CUDA_ERROR(cudaGetLastError());
+  cudaDeviceSynchronize();
+}}
+
+void {self.launch_name}({", ".join(torch_args)}) {{
+{chr(10).join(check_lines)}
+  {self.launch_name}_internal({", ".join(call_args)});
+}}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+  m.def("launch", &{self.launch_name}, "PyTorch wrapper for generated kernel");
+}}
+"""
+
         return t.render(
             constants=self.constants,
             globals_name=globals_name,
             aliases=aliases,
             kernel_vars=kernel_vars,
             kernel_stmt=self.kernel_stmt,
-            launch_code=self.launch_code
+            launch_code=launch_code
         )

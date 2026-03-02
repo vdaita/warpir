@@ -103,6 +103,9 @@ class Var():
         self.var_type = var_type
     
     def define(self):
+        t = self.var_type
+        if hasattr(t, 'alias_name') and t.alias_name:
+            return f"{t.alias_name} {self.name};"
         return f"{self.var_type} {self.name};"
     
     def use(self):

@@ -64,7 +64,7 @@ static constexpr int BLOCK_SIZE = {block_size_val};
     store_stmt = OpCall("warpgroup::store", g.C, C_accum_cpy, Coord(0, 0, row, col))
 
     return Program(
-        input_vars=[], 
+        input_vars=[Var("A", ScalarType("bf16*")), Var("B", ScalarType("bf16*")), Var("C", ScalarType("bf16*")), Var("N", ScalarType("size_t"))], 
         kernel_vars=g, 
         kernel_stmt=SeqStmt([
             SharedAllocStmt("As", ab_type, count=2),
@@ -92,7 +92,11 @@ static constexpr int BLOCK_SIZE = {block_size_val};
             for_stmt,
             store_stmt
         ]),
-        constants=constants
+        constants=constants,
+        grid_dims="(N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE",
+        block_dims="NUM_THREADS",
+        shared_mem="102400",
+        launch_name="matmul"
     )
 
 if __name__ == "__main__":

@@ -59,32 +59,8 @@ static constexpr int NUM_THREADS = (NUM_WORKERS*kittens::WARP_THREADS);
     )
     store_stmt = OpCall("kittens::warp::store", g.C, C_accum, Coord(0, 0, row, col))
 
-    launch_code = """
-// launch kernel
-void matmul(bf16* A, bf16* B, bf16* C, size_t N) { 
-
-    // global pointers
-    using a_gl = kernel_globals::tile_gl;
-    using b_gl = kernel_globals::tile_gl; 
-    using c_gl = kernel_globals::tile_gl;
-    a_gl  a_arg{A, nullptr, nullptr, (int)N, (int)N};
-    b_gl  b_arg{B, nullptr, nullptr, (int)N, (int)N};
-    c_gl  c_arg{C, nullptr, nullptr, (int)N, (int)N};
-    kernel_globals g{a_arg, b_arg, c_arg, (int)N}; 
-
-    // launch
-    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);  // Watch out for requesting too many!
-    unsigned long mem_size = 100000;
-    cudaDeviceSynchronize();
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    kernel<<<blocks, NUM_THREADS, mem_size>>>(g);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-    cudaDeviceSynchronize();
-}
-"""
-
     return Program(
-        input_vars=[], 
+        input_vars=[Var("A", ScalarType("bf16*")), Var("B", ScalarType("bf16*")), Var("C", ScalarType("bf16*")), Var("N", ScalarType("size_t"))], 
         kernel_vars=g, 
         kernel_stmt=SeqStmt([
             As.def_(),
@@ -102,7 +78,10 @@ void matmul(bf16* A, bf16* B, bf16* C, size_t N) {
             store_stmt
         ]),
         constants=constants,
-        launch_code=launch_code
+        grid_dims="(N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE",
+        block_dims="NUM_THREADS",
+        shared_mem="100000",
+        launch_name="matmul"
     )
 
 if __name__ == "__main__":
