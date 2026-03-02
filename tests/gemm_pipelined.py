@@ -1,45 +1,82 @@
 from warpir import *
+from warpir.ops import BuiltinExpr
 
 def build_gemm_kernel() -> Program:
-    block_size, qsize = 64, 2
+    block_size = 64
     ab_type = SharedTileType(GPUType.bf16, block_size, block_size, SharedTileLayout.row_major)
     accum_type = RegTileType(GPUType.fp32, 16, block_size, RegTileLayout.row_major)
 
-    g = KernelGlobals(A=GlobalType(GPUType.bf16, ab_type), B=GlobalType(GPUType.bf16, ab_type),
-                      C=GlobalType(GPUType.bf16, ab_type), N=ScalarType("int"))
-    As, Bs = [Tile(f"As_{i}", ab_type) for i in range(2)], [Tile(f"Bs_{i}", ab_type) for i in range(2)]
-    C_accum = Tile("C_accum", accum_type)
+    g = KernelGlobals(A=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1),
+                      B=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1),
+                      C=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1), 
+                      N=ScalarType("int"))
     
+    # We will just declare these manually for exact array layout matching instead of lists of tiles
+    # In kitten it was `st_bf<BLOCK_SIZE,BLOCK_SIZE> (&As)[2] = al.allocate<st_bf<BLOCK_SIZE,BLOCK_SIZE>, 2>();`
+    # Let's use SharedAllocStmt count=2.
+    As = Tile("As", ab_type)
+    Bs = Tile("Bs", ab_type)
+    
+    C_accum = Tile("C_accum", accum_type)
+    C_accum_cpy = Tile("C_accum_cpy", accum_type)
+
     row, col = Var("row", ScalarType("int")), Var("col", ScalarType("int"))
     num_tiles = Var("num_tiles", ScalarType("int"))
+    
+    tic = Var("tic", ScalarType("int"))
+    toc = Var("toc", ScalarType("int"))
+    
+    bar = Symbol("bar")
 
-    k_index = Var("k_index", ScalarType("int"))
+    tile = Var("tile", ScalarType("int"))
     for_stmt = ForStmt(
-        AssignStmt(k_index, 0),
-        k_index < num_tiles,
-        AssignStmt(k_index, k_index + 1),
+        AssignStmt(tile, 0),
+        tile < num_tiles,
+        BuiltinExpr("++tile, tic^=1, toc^=1"),
         SeqStmt([
-            g.A.load(As[0], Coord(0, 0, row, k_index)),
-            g.B.load(Bs[0], Coord(0, 0, k_index, col)),
-            g.A.load(As[1], Coord(0, 0, row, k_index + 1)),
-            g.B.load(Bs[1], Coord(0, 0, k_index + 1, col)),
-            MMAOp(C_accum, As[0], Bs[0]),
-            MMAWaitOp(),
-            MMAOp(C_accum, As[1], Bs[1]),
-            MMAWaitOp()
+            OpCall("wait", bar, tic),
+            OpCall("__syncthreads"),
+            IfStmt(
+                BuiltinExpr("threadIdx.x == 0 && tile+1 < num_tiles"),
+                SeqStmt([
+                    OpCall("tma::expect_bytes", bar, BuiltinExpr("size_bytes<typeof(As[0])> + size_bytes<typeof(Bs[0])>")),
+                    OpCall("tma::load_async", "As[toc]", g.A, Coord(0, 0, row, BuiltinExpr("tile+1")), bar),
+                    OpCall("tma::load_async", "Bs[toc]", g.B, Coord(0, 0, BuiltinExpr("tile+1"), col), bar)
+                ])
+            ),
+            OpCall("warpgroup::mma_AB", C_accum, "As[tic]", "Bs[tic]"),
+            OpCall("warpgroup::mma_async_wait"),
+            OpCall("kittens::warp::add", C_accum_cpy, C_accum_cpy, C_accum),
+            OpCall("kittens::warp::zero", C_accum),
+            OpCall("__syncthreads")
         ])
     )
-    store_stmt = g.C.store(C_accum, Coord(0, 0, row, col))
+    store_stmt = OpCall("warpgroup::store", g.C, C_accum_cpy, Coord(0, 0, row, col))
 
     return Program(input_vars=[], kernel_vars=g, kernel_stmt=SeqStmt([
+        SharedAllocStmt("As", ab_type, count=2),
+        SharedAllocStmt("Bs", ab_type, count=2),
+        DeclStmt(tic, 0),
+        DeclStmt(toc, 1),
+        C_accum.def_(),
+        C_accum_cpy.def_(),
         DeclStmt(row, getConst("blockIdx.y")),
         DeclStmt(col, getConst("blockIdx.x")),
+        DeclStmt(Var("condition", ScalarType("int")), BuiltinExpr("(threadIdx.x == 0 && threadIdx.y == 0 & blockIdx.x == 0)")),
+        BuiltinExpr("__shared__ semaphore bar;"),
+        IfStmt(
+            BuiltinExpr("threadIdx.x == 0"),
+            SeqStmt([
+                OpCall("init_semaphore", bar, 0, 1),
+                OpCall("tma::expect_bytes", bar, BuiltinExpr("size_bytes<typeof(As[0])> + size_bytes<typeof(Bs[0])>")),
+                OpCall("tma::load_async", "As[tic]", g.A, Coord(0, 0, row, 0), bar),
+                OpCall("tma::load_async", "Bs[tic]", g.B, Coord(0, 0, 0, col), bar)
+            ])
+        ),
+        OpCall("__syncthreads"),
+        OpCall("kittens::warp::zero", C_accum_cpy),
         DeclStmt(num_tiles, (g.N + block_size - 1) / block_size),
-        *[Ai.def_() for Ai in As],
-        *[Bi.def_() for Bi in Bs],
-        C_accum.def_(),
-        OpCall("kittens::warp::zero", C_accum),
-        DeclStmt(k_index),
+        DeclStmt(tile),
         for_stmt,
         store_stmt
     ]))

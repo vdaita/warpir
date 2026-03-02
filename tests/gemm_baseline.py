@@ -1,90 +1,63 @@
 from warpir import *
 
 def build_gemm_kernel() -> Program:
-    block_size = 64
-    # Shared tiles: 64x64 bf16 tiles for A and B, and a 64x64 bf16 tile for the C output
-    ab_type   = SharedTileType(GPUType.bf16, block_size, block_size, SharedTileLayout.row_major)
-    c_sh_type = SharedTileType(GPUType.bf16, block_size, block_size, SharedTileLayout.row_major)
+    block_size = 32
+    ab_type = SharedTileType(GPUType.bf16, block_size, block_size, SharedTileLayout.row_major)
+    # Output accumulates locally to a float tile
+    accum_type = RegTileType(GPUType.fp32, block_size, block_size, RegTileLayout.row_major)
+    
+    # Global types have depth=1, height=1
+    g = KernelGlobals(A=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1), 
+                      B=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1),
+                      C=GlobalType(GPUType.bf16, ab_type, batch_dim=1, depth_dim=1), 
+                      N=ScalarType("int"))
+    
+    As = Tile("As", ab_type)
+    Bs = Tile("Bs", ab_type)
+    
+    A_reg = Tile("A_reg", RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.row_major))
+    B_reg = Tile("B_reg", RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.row_major))
+    B_reg_col = Tile("B_reg_col", RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.col_major))
+    
+    C_accum = Tile("C_accum", accum_type)
 
-    g = KernelGlobals(
-        A=GlobalType(GPUType.bf16, ab_type),
-        B=GlobalType(GPUType.bf16, ab_type),
-        C=GlobalType(GPUType.bf16, c_sh_type),
-        N=ScalarType("int"),
-    )
-
-    A_sh = Tile("A_sh", ab_type)
-    B_sh = Tile("B_sh", ab_type)
-    C_sh = Tile("C_sh", c_sh_type)
-
-    row       = Var("row",       ScalarType("int"))
-    col       = Var("col",       ScalarType("int"))
+    row, col = Var("row", ScalarType("int")), Var("col", ScalarType("int"))
     num_tiles = Var("num_tiles", ScalarType("int"))
-    k_index   = Var("k_index",   ScalarType("int"))
 
-    # Inner loop body – use RawStmt so we can use exact TK register-tile types
-    # and warp-level MMA that compile on both Ampere and Hopper.
-    #
-    # Each warpgroup (4 warps, 128 threads) cooperatively loads a 64x64 tile into
-    # shared memory, then each warp independently handles a 16-row slice via
-    # warp::load (shared→register) and warp::mma_AB (fp32 accumulation).
-    loop_body = SeqStmt([
-        # Global → Shared (warpgroup collaborative, no TMA needed)
-        OpCall("warpgroup::load", A_sh, g.A, Coord(0, 0, row, k_index)),
-        OpCall("warpgroup::load", B_sh, g.B, Coord(0, 0, k_index, col)),
-        RawStmt("__syncthreads();"),
-        # Shared → Register + MMA (warp-level; each warp owns 16 rows of A)
-        # We accumulate into a local fp32 register tile and add into C_accum.
-        RawStmt("""\
-{
-    rt_fl<16, 64, ducks::rt_layout::row> local_c;
-    rt_bf<16, 64, ducks::rt_layout::row> local_a;
-    rt_bf<64, 16, ducks::rt_layout::col> local_b;
-    warp::load(local_a, A_sh);
-    warp::load(local_b, B_sh);
-    warp::mma_AB(C_accum, local_a, local_b, C_accum);
-}"""),
-        RawStmt("__syncthreads();"),
-    ])
-
+    tile = Var("tile", ScalarType("int"))
     for_stmt = ForStmt(
-        AssignStmt(k_index, 0),
-        k_index < num_tiles,
-        AssignStmt(k_index, k_index + 1),
-        loop_body,
+        AssignStmt(tile, 0),
+        tile < num_tiles,
+        BuiltinExpr("++tile"),
+        SeqStmt([
+            OpCall("kittens::warp::load", As, g.A, Coord(0, 0, row, tile)),
+            OpCall("kittens::warp::load", Bs, g.B, Coord(0, 0, tile, col)),
+            OpCall("__syncthreads"),
+            OpCall("kittens::warp::load", A_reg, As),
+            OpCall("kittens::warp::load", B_reg, Bs),
+            OpCall("kittens::warp::swap_layout", B_reg_col, B_reg),
+            OpCall("__syncthreads"),
+            OpCall("kittens::warp::mma_AB", C_accum, A_reg, B_reg_col, C_accum),
+            OpCall("__syncthreads")
+        ])
     )
+    store_stmt = OpCall("kittens::warp::store", g.C, C_accum, Coord(0, 0, row, col))
 
-    # After accumulation: convert fp32 → bf16, spill to shared, then global store.
-    store_stmts = SeqStmt([
-        RawStmt("""\
-{
-    rt_bf<16, 64, ducks::rt_layout::row> C_bf;
-    warp::copy(C_bf, C_accum);
-    warp::store(C_sh, C_bf);
-}"""),
-        RawStmt("__syncthreads();"),
-        OpCall("warpgroup::store", g.C, C_sh, Coord(0, 0, row, col)),
-    ])
-
-    return Program(
-        input_vars=[],
-        kernel_vars=g,
-        kernel_stmt=SeqStmt([
-            DeclStmt(row, getConst("blockIdx.y")),
-            DeclStmt(col, getConst("blockIdx.x")),
-            DeclStmt(num_tiles, (g.N + block_size - 1) / block_size),
-            A_sh.def_(),
-            B_sh.def_(),
-            C_sh.def_(),
-            # Declare the fp32 accumulator register tile (local to each warp)
-            RawStmt("rt_fl<16, 64, ducks::rt_layout::row> C_accum;"),
-            OpCall("warp::zero", getConst("C_accum")),
-            DeclStmt(k_index),
-            for_stmt,
-            store_stmts,
-        ]),
-    )
-
+    return Program(input_vars=[], kernel_vars=g, kernel_stmt=SeqStmt([
+        As.def_(),
+        Bs.def_(),
+        A_reg.def_(),
+        B_reg.def_(),
+        B_reg_col.def_(),
+        C_accum.def_(),
+        DeclStmt(col, getConst("blockIdx.x")),
+        DeclStmt(row, getConst("blockIdx.y")),
+        OpCall("kittens::warp::zero", C_accum),
+        DeclStmt(num_tiles, (g.N + block_size - 1) / block_size),
+        DeclStmt(tile),
+        for_stmt,
+        store_stmt
+    ]))
 
 if __name__ == "__main__":
     print(emit_cpp(build_gemm_kernel()))
