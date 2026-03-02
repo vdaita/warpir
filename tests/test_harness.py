@@ -10,7 +10,10 @@ sys.path.append(
     os.path.dirname(os.path.abspath(__file__))))
 
 # for including kittens.cuh in kernel compilation
-THUNDERKITTENS_INCLUDE_PATH = "/home/ubuntu/warpir/thunderkittens/include"
+THUNDERKITTENS_INCLUDE_PATH = os.environ.get(
+    "THUNDERKITTENS_INCLUDE_PATH",
+    "/home/ubuntu/warpir/thunderkittens/include"  # fallback default
+)
 
 OUTPUT_DIR = os.path.join(
   os.path.dirname(os.path.abspath(__file__)),
@@ -42,13 +45,13 @@ void launch_kernel(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
     
     size_t N = A.size(0);
     int BLOCK_SIZE = 64;
-    int NUM_WORKERS = 8;
+    int NUM_WORKERS = 4;
     int NUM_THREADS = (NUM_WORKERS * 32); 
     
-    using a_gl = gl<bf16, 1, 1, -1, -1, st_bf<64, 64>>;
-    a_gl a_arg{{reinterpret_cast<bf16*>(A.data_ptr<at::BFloat16>()), nullptr, nullptr, N, N}};
-    a_gl b_arg{{reinterpret_cast<bf16*>(B.data_ptr<at::BFloat16>()), nullptr, nullptr, N, N}};
-    a_gl c_arg{{reinterpret_cast<bf16*>(C.data_ptr<at::BFloat16>()), nullptr, nullptr, N, N}};
+    using a_gl = gl<bf16, -1, -1, -1, -1, st_bf<64, 64>>;
+    a_gl a_arg{{reinterpret_cast<bf16*>(A.data_ptr<at::BFloat16>()), 1, 1, N, N}};
+    a_gl b_arg{{reinterpret_cast<bf16*>(B.data_ptr<at::BFloat16>()), 1, 1, N, N}};
+    a_gl c_arg{{reinterpret_cast<bf16*>(C.data_ptr<at::BFloat16>()), 1, 1, N, N}};
     
     kernel_globals g{{a_arg, b_arg, c_arg, N}};
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
