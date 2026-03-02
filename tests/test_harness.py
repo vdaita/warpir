@@ -10,12 +10,7 @@ sys.path.append(
     os.path.dirname(os.path.abspath(__file__))))
 
 # for including kittens.cuh in kernel compilation
-THUNDERKITTENS_INCLUDE_PATH = os.path.join(
-  os.path.dirname(
-    os.path.dirname(
-      os.path.dirname(
-        os.path.abspath(__file__)))),
-  "ThunderKittens", "include")
+THUNDERKITTENS_INCLUDE_PATH = "/home/ubuntu/warpir/thunderkittens/include"
 
 OUTPUT_DIR = os.path.join(
   os.path.dirname(os.path.abspath(__file__)),
@@ -135,11 +130,9 @@ def generate_and_test(name, program):
         print(e)
         
 if __name__ == "__main__":
-    
-    # Clean previous torch extensions lockfile to avoid ninja stuck errors
     if os.path.exists("outputs/lock"):
-        os.remove("outputs/lock")
-
+        os.removedirs("output/lock")
+    os.makedirs(os.path.dirname('outputs/lock'), exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     generate_and_test("gemm_baseline", build_baseline())
