@@ -17,7 +17,7 @@ static constexpr int NUM_THREADS = (NUM_WORKERS*kittens::WARP_THREADS);
 
     # Use aliases in KernelGlobals
     g = KernelGlobals(
-        name="matmul_globals",
+        name="kernel_globals",
         A=tile_gl,
         B=tile_gl,
         C=tile_gl,
@@ -64,13 +64,13 @@ static constexpr int NUM_THREADS = (NUM_WORKERS*kittens::WARP_THREADS);
 void matmul(bf16* A, bf16* B, bf16* C, size_t N) { 
 
     // global pointers
-    using a_gl = matmul_globals::tile_gl;
-    using b_gl = matmul_globals::tile_gl; 
-    using c_gl = matmul_globals::tile_gl;
+    using a_gl = kernel_globals::tile_gl;
+    using b_gl = kernel_globals::tile_gl; 
+    using c_gl = kernel_globals::tile_gl;
     a_gl  a_arg{A, nullptr, nullptr, (int)N, (int)N};
     b_gl  b_arg{B, nullptr, nullptr, (int)N, (int)N};
     c_gl  c_arg{C, nullptr, nullptr, (int)N, (int)N};
-    matmul_globals g{a_arg, b_arg, c_arg, (int)N}; 
+    kernel_globals g{a_arg, b_arg, c_arg, (int)N}; 
 
     // launch
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);  // Watch out for requesting too many!

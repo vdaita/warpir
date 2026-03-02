@@ -22,8 +22,7 @@ class SharedTileType:
         self.layout = layout
         self.alias_name = alias_name
     def __str__(self):
-        if self.alias_name:
-            return self.alias_name
+        return self.emit_type()
     def emit_type(self):
         if self.data_type == GPUType.bf16:
             return f"st_bf<{self.tile_w}, {self.tile_h}>"
