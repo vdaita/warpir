@@ -2,10 +2,27 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+from subprocess import PIPE, run
 
-from .format import format_cpp
 from .flow import Program
 
+
+def format_cpp(code: str) -> str:
+    """
+    Format C++ code using clang-format.
+    Requires the `clang-format` package/executable in the environment.
+    """
+    proc = run(
+        ["clang-format"],
+        input=code.encode("utf-8"),
+        stdout=PIPE,
+        stderr=PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="ignore")
+        raise RuntimeError(f"clang-format failed: {err.strip()}")
+    return proc.stdout.decode("utf-8")
 
 def try_format_cpp(code: str) -> str:
     try:
