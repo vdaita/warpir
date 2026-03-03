@@ -5,6 +5,7 @@ from warpir.layouts import SharedVecType
 from typing import Optional, Sequence, Union, List
 from abc import ABC, abstractmethod
 from jinja2 import Environment
+from dataclasses import dataclass
 from .layouts import SharedTileType, ScalarType, VarType, SharedSemaphoreType, GlobalType
 
 class Expr(ABC):
@@ -45,7 +46,7 @@ class BinaryOp(Expr):
         self.op_type = op_type
 
     def __str__(self):
-        return f"{self.a} {self.op_type} {self.b}"
+        return f"({self.a} {self.op_type} {self.b})"
 
 class ForStmt(Stmt):
     def __init__(self, init: Expr, cond: Expr, step: Expr, body: Stmt):
@@ -92,7 +93,7 @@ class RawExpr(Expr):
 
 class RawStmt(Stmt):
     def __init__(self, code: str):
-        self.code = code
+        self.code = str(code)
 
     def __str__(self) -> str:
         return self.code.rstrip()
@@ -134,6 +135,9 @@ class IfStmt(Stmt):
 
 def lane0_if(stmt: Stmt) -> Stmt:
     return IfStmt(BinaryOp(RawExpr("0"), RawExpr("warpgroup::laneid()"), "=="), stmt)
+
+def thread0_if(stmt: Stmt) -> Stmt:
+    return IfStmt(BinaryOp(RawExpr("0"), RawExpr("threadIdx.x"), "=="), stmt)
 
 class DeclStmt(Stmt):
     def __init__(self, var: Var):
@@ -212,11 +216,15 @@ class Tile(Var):
         if self.use_semaphores:
             stmts.append(self.full_sem.declare())
             stmts.append(self.empty_sem.declare())
+            stmts.append(self.full_tic.declare())
+            stmts.append(self.empty_tic.declare())
+            stmts.append(AssignExpr(self.full_tic, RawExpr(0)).to_stmt())
+            stmts.append(AssignExpr(self.empty_tic, RawExpr(0)).to_stmt())
             stmts.append(
-                lane0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, RawExpr("0"), RawExpr("1")])))
+                thread0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, RawExpr("0"), RawExpr("1")])))
             )
             stmts.append(
-                lane0_if(ExprStmt(OpCall("init_semaphore", [self.empty_sem, RawExpr(f"{self.num_consumers}"), RawExpr("0")])))
+                thread0_if(ExprStmt(OpCall("init_semaphore", [self.empty_sem, RawExpr(f"{self.num_consumers}"), RawExpr("0")])))
             )
         return SeqStmt(stmts)
 
@@ -228,10 +236,18 @@ class Tile(Var):
         ]
         return SeqStmt(stmts)
 
-    def store_global(self, dst: Var, coord: Coord):
+    def warp_store_global(self, dst: Var, coord: Coord):
         assert type(dst.var_type) == GlobalType, "loads must happen from global variable sources"
         stmts: List[Stmt] = [
             ExprStmt(OpCall("kittens::warp::store", [self, dst, coord])),
+            ExprStmt(OpCall("__syncthreads", []))
+        ]
+        return SeqStmt(stmts)
+    
+    def warpgroup_store_global(self, dst: Var, coord: Coord):
+        assert type(dst.var_type) == GlobalType, "loads must happen from global variable sources"
+        stmts: List[Stmt] = [
+            ExprStmt(OpCall("warpgroup::store", [self, dst, coord])),
             ExprStmt(OpCall("__syncthreads", []))
         ]
         return SeqStmt(stmts)
@@ -244,12 +260,13 @@ class Tile(Var):
         ]
         return SeqStmt(stmts)
 
-    def async_load(self, src: Var, coord: Coord) -> Stmt:
+    def async_load_global(self, src: Var, coord: Coord) -> Stmt:
         assert type(src.var_type) == GlobalType, "TMA loads must happen from global variable sources"
         stmts: List[Stmt] = [
             ExprStmt(OpCall("tma::expect_bytes", [self.full_sem, SizeBytesExpr(self)])),
             ExprStmt(OpCall("tma::load_async", [self, src, coord, self.full_sem]))
         ]
+
         return lane0_if(SeqStmt(stmts))
 
     def wait_full(self):
@@ -266,6 +283,68 @@ class Tile(Var):
             ExprStmt(OpCall("__syncthreads", []))
         ])
 
+@dataclass
+class MemLoad:
+    source: Var
+    dest: Tile
+    coord: Coord
+
+class MultiTileManager:
+    def __init__(
+        self,
+        name: str,
+        tiles: List[Tile],
+        num_consumers: int = 1
+    ):
+        self.name = name
+        self.tiles = tiles
+        self.num_consumers = num_consumers
+
+        self.full_sem = Var(f"full_{self.name}", SharedSemaphoreType())
+        self.empty_sem = Var(f"empty_{self.name}", SharedSemaphoreType())
+        self.full_tic = Var(f"tic_full_{self.name}", ScalarType("int"))
+        self.empty_tic = Var(f"tic_empty_{self.name}", ScalarType("int"))
+
+    def initialize(self):
+        stmts: List[Stmt] = []
+        stmts.append(self.full_sem.declare())
+        stmts.append(self.empty_sem.declare())
+        stmts.append(self.full_tic.declare())
+        stmts.append(self.empty_tic.declare())
+        stmts.append(AssignExpr(self.full_tic, RawExpr(0)).to_stmt())
+        stmts.append(AssignExpr(self.empty_tic, RawExpr(0)).to_stmt())
+        stmts.append(
+            thread0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, RawExpr("0"), RawExpr("1")])))
+        )
+        stmts.append(
+            thread0_if(ExprStmt(OpCall("init_semaphore", [self.empty_sem, RawExpr(f"{self.num_consumers}"), RawExpr("0")])))
+        )
+        return SeqStmt(stmts)
+    
+    def async_load_global(self, loads: List[MemLoad]) -> Stmt:
+        num_bytes = SizeBytesExpr(self.tiles[0])
+        for tile_idx in range(1, len(self.tiles)):
+            num_bytes = BinaryOp(num_bytes, SizeBytesExpr(self.tiles[tile_idx]), "+")
+        stmts: List[Stmt] = [
+            ExprStmt(OpCall("tma::expect_bytes", [self.full_sem, num_bytes]))
+        ] + [
+            ExprStmt(OpCall("tma::load_async", [load.dest, load.source, load.coord, self.full_sem])) for load in loads if load.dest in self.tiles
+        ]
+        return lane0_if(SeqStmt(stmts))
+
+    def wait_full(self):
+        return SeqStmt([
+            ExprStmt(OpCall("wait", [self.full_sem, self.full_tic])),
+            AssignExpr(self.full_tic, BinaryOp(self.full_tic, RawExpr("1"), "^")).to_stmt(),
+            ExprStmt(OpCall("__syncthreads", []))
+        ])
+    
+    def wait_empty(self):
+        return SeqStmt([
+            ExprStmt(OpCall("wait", [self.empty_sem, self.empty_tic])),
+            AssignExpr(self.empty_tic, BinaryOp(self.empty_tic, RawExpr("1"), "^")).to_stmt(),
+            ExprStmt(OpCall("__syncthreads", []))
+        ])
 
 KITTENS_TEMPLATE = """
 #include <iostream>

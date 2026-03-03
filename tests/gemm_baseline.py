@@ -47,9 +47,9 @@ def build_gemm_kernel() -> Program:
         body
     )
 
-    store_stmt = C_accum.store_global(C, Coord([RawExpr(0), RawExpr(0), row, col]))
+    store_stmt = C_accum.warp_store_global(C, Coord([RawExpr(0), RawExpr(0), row, col]))
     program_body = SeqStmt(
-        [var.declare() for var in [As, Bs, A_reg, B_reg, B_reg_col, C_accum]] +
+        [var.declare() for var in [As, Bs, A_reg, B_reg, B_reg_col, C_accum, tile]] +
         [
             zero_op_stmt,
             loop,
