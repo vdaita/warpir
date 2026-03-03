@@ -71,7 +71,7 @@ def generate_and_test(name, program):
         print(f"[{name}] Compilation took {t1 - t0:.2f}s")
         print(f"[{name}] Executing on GPU...")
         t0 = time()
-        ext.launch(A, B, C)
+        ext.launch(A, B, C, N)
         torch.cuda.synchronize()
         t1 = time()
         print(f"[{name}] GPU Execution time: {(t1 - t0) * 1000:.2f}ms")
