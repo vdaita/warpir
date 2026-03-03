@@ -74,10 +74,10 @@ def build_gemm_kernel() -> Program:
         )
     )
 
-    prime_empty = lane0_if(SeqStmt([
-        ExprStmt(OpCall("arrive", [lms[i].empty_sem, RawExpr(1)]))
+    prime_empty = SeqStmt([
+        lms[i].arrive_empty()
         for i in range(QSIZE)
-    ]))
+    ])
 
     producer_block = SeqStmt([
         OpCall("warpgroup::decrease_registers<32>", []).to_stmt(),

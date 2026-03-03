@@ -206,84 +206,51 @@ class Tile(Var):
         super().__init__(name, var_type)
         self.use_semaphores = use_semaphores
         self.num_consumers = num_consumers
-
         self.var = Var(self.name, self.var_type)
-        self.full_sem = Var(f"full_{self.name}", SharedSemaphoreType())
-        self.empty_sem = Var(f"empty_{self.name}", SharedSemaphoreType())
-        
-        self.full_tic = Var(f"tic_full_{self.name}", ScalarType("int"))
-        self.empty_tic = Var(f"tic_empty_{self.name}", ScalarType("int"))
 
+        if use_semaphores:
+            self._manager = MultiTileLoadManager(name, [self], num_consumers)
 
     def declare(self) -> Stmt:
-        stmts: List[Stmt] = [
-            self.var.declare()
-        ]
+        stmts: List[Stmt] = [self.var.declare()]
         if self.use_semaphores:
-            stmts.append(self.full_sem.declare())
-            stmts.append(self.empty_sem.declare())
-            stmts.append(self.full_tic.declare())
-            stmts.append(self.empty_tic.declare())
-            stmts.append(AssignExpr(self.full_tic, RawExpr(0)).to_stmt())
-            stmts.append(AssignExpr(self.empty_tic, RawExpr(0)).to_stmt())
-            stmts.append(
-                thread0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, RawExpr("0"), RawExpr("1")])))
-            )
-            stmts.append(
-                thread0_if(ExprStmt(OpCall("init_semaphore", [self.empty_sem, RawExpr(f"{self.num_consumers}"), RawExpr("0")])))
-            )
+            stmts.append(self._manager.initialize())
         return SeqStmt(stmts)
 
     def load_global(self, src: Var, coord: Coord):
-        assert type(src.var_type) == GlobalType, "loads must happen from global variable sources"
-        stmts: List[Stmt] = [
+        assert type(src.var_type) == GlobalType
+        return SeqStmt([
             ExprStmt(OpCall("kittens::warp::load", [self, src, coord])),
             ExprStmt(OpCall("__syncthreads", []))
-        ]
-        return SeqStmt(stmts)
+        ])
 
     def warp_store_global(self, dst: Var, coord: Coord):
-        assert type(dst.var_type) == GlobalType, "loads must happen from global variable sources"
-        stmts: List[Stmt] = [
-            ExprStmt(OpCall("kittens::warp::store", [self, dst, coord])),
-        ]
-        return SeqStmt(stmts)
-    
+        assert type(dst.var_type) == GlobalType
+        return ExprStmt(OpCall("kittens::warp::store", [self, dst, coord]))
+
     def warpgroup_store_global(self, dst: Var, coord: Coord):
-        assert type(dst.var_type) == GlobalType, "loads must happen from global variable sources"
-        stmts: List[Stmt] = [
-            ExprStmt(OpCall("warpgroup::store", [self, dst, coord])),
-        ]
-        return SeqStmt(stmts)
+        assert type(dst.var_type) == GlobalType
+        return ExprStmt(OpCall("warpgroup::store", [self, dst, coord]))
 
     def load_shared(self, src: Var):
-        assert type(src.var_type) == SharedTileType or type(self.var_type) == SharedVecType, "load_shared must happen from shared" # lot more checking to be done here
-        stmts: List[Stmt] = [
+        assert type(src.var_type) == SharedTileType or type(self.var_type) == SharedVecType
+        return SeqStmt([
             ExprStmt(OpCall("kittens::warp::load", [self, src])),
             ExprStmt(OpCall("__syncthreads", []))
-        ]
-        return SeqStmt(stmts)
+        ])
 
     def async_load_global(self, src: Var, coord: Coord) -> Stmt:
-        assert type(src.var_type) == GlobalType, "TMA loads must happen from global variable sources"
-        stmts: List[Stmt] = [
-            ExprStmt(OpCall("tma::expect_bytes", [self.full_sem, SizeBytesExpr(self)])),
-            ExprStmt(OpCall("tma::load_async", [self, src, coord, self.full_sem]))
-        ]
+        assert type(src.var_type) == GlobalType
+        return self._manager.async_load_global([MemLoad(src, self, coord)])
 
-        return lane0_if(SeqStmt(stmts))
+    def wait_full(self, level):
+        return self._manager.wait_full(level)
 
-    def wait_full(self):
-        return SeqStmt([
-            ExprStmt(OpCall("wait", [self.full_sem, self.full_tic])),
-            AssignExpr(self.full_tic, BinaryOp(self.full_tic, RawExpr("1"), "^")).to_stmt(),
-        ])
-    
-    def wait_empty(self):
-        return SeqStmt([
-            ExprStmt(OpCall("wait", [self.empty_sem, self.empty_tic])),
-            AssignExpr(self.empty_tic, BinaryOp(self.empty_tic, RawExpr("1"), "^")).to_stmt(),
-        ])
+    def wait_empty(self, level):
+        return self._manager.wait_empty(level)
+
+    def arrive_empty(self):
+        return self._manager.arrive_empty()
 
 @dataclass
 class MemLoad:
@@ -344,14 +311,17 @@ class MultiTileLoadManager:
         return SeqStmt(stmts)
     
     def wait_empty(self, level):
-        return SeqStmt([
+        stmts = [
             ExprStmt(OpCall("wait", [self.empty_sem, self.empty_tic])),
             AssignExpr(self.empty_tic, BinaryOp(self.empty_tic, RawExpr("1"), "^")).to_stmt()
-        ])
+        ]
         if level == Level.block:
             stmts.append(OpCall("__syncthreads", []).to_stmt())
         return SeqStmt(stmts)
 
+    def arrive_empty(self):
+        return lane0_if(OpCall("arrive", [self.empty_sem, RawExpr(1)]).to_stmt())
+        
 KITTENS_TEMPLATE = """
 #include <iostream>
 #include <random>
