@@ -1,7 +1,7 @@
 from warpir import *
-from warpir.sir import SIR, MemLoad
+from warpir.sir import SIR, TMA, MMA, MemLoad
 
-def build_gemm_kernel() -> Program:
+def build_gemm_kernel() -> tuple[Program, SIR]:
     BLOCK_SIZE  = 64
     shared_type = SharedTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE, SharedTileLayout.row_major)
     accum_type  = RegTileType(GPUType.fp32, 16, BLOCK_SIZE, RegTileLayout.row_major)
@@ -12,34 +12,31 @@ def build_gemm_kernel() -> Program:
     for v in [A, B, C, N]: g.add_var(v)
 
     row, col  = RawExpr("blockIdx.y"), RawExpr("blockIdx.x")
-    tile      = Var("tile", ScalarType("int"))
     zero      = RawExpr(0)
     num_tiles = BinaryOp(BinaryOp(N, RawExpr(BLOCK_SIZE - 1), "+"), RawExpr(BLOCK_SIZE), "/")
 
     sir = SIR()
-    As  = sir.tile(shared_type)
-    Bs  = sir.tile(shared_type)
-    acc = sir.tile(accum_type)
+    As  = sir.tile("As", shared_type)
+    Bs  = sir.tile("Bs", shared_type)
+    acc = sir.tile("acc", accum_type)
     sir.op("kittens::warp::zero", acc)
 
-    def loop_body(s: SIR):
-        group          = s.tma.load([
-            MemLoad(A, As, Coord([zero, zero, row, tile])),
-            MemLoad(B, Bs, Coord([zero, zero, tile, col])),
-        ])
-        As_rdy, Bs_rdy = s.tma.consume(group)
-        result         = s.mma.produce(As_rdy, Bs_rdy, acc)
-        s.mma.consume(result)
+    i, loop = sir.add_loop(num_tiles)
 
-    sir.loop(tile, num_tiles, loop_body)
-    sir.op("warpgroup::store", acc, C, Coord([zero, zero, row, col]))
+    [As_loaded, Bs_loaded], ab_scope = loop.tma_load([
+        MemLoad(A, As, Coord([zero, zero, row, i])),
+        MemLoad(B, Bs, Coord([zero, zero, i, col])),
+    ])
+    loop._emit(ab_scope)
+    ab_scope.mma(As_loaded, Bs_loaded, acc)
+
+    sir.add_store(acc, C, Coord([zero, zero, row, col]))
 
     return Program(kernel_vars=g, kernel_stmt=sir.emit()), sir
 
 
 if __name__ == "__main__":
-    import subprocess, os
-    os.makedirs("outputs", exist_ok=True)
-    
+    from warpir.compiler import emit_cpp
     p, sir = build_gemm_kernel()
     print(emit_cpp(p))
+    sir.save_graph("outputs/sir_graph.png")

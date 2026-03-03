@@ -1,265 +1,172 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from .layouts import *
 from .flow import *
+import networkx as nx
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
-
-# ── graph nodes (for visualization only) ─────────────────────────────────────
 
 @dataclass
-class GraphNode:
-    id:    str
-    label: str
-    color: str
-    edges: List[str] = field(default_factory=list)
-
-
-# ── async handles ─────────────────────────────────────────────────────────────
-
-@dataclass
-class TMAGroup:
-    """Handle returned by TMA.load — represents in-flight tiles."""
-    tiles:    List[Tile]
-    manager:  MultiTileLoadManager
-    node_id:  str
+class MMAState:
+    nid:      str
     consumed: bool = False
 
+    def consume(self) -> None:
+        assert not self.consumed, "MMAState already consumed"
+        self.consumed = True
 
-@dataclass
-class MMAResult:
-    """Handle returned by MMA.produce — represents an in-flight accumulation."""
-    tile:       Tile
-    produce_id: str
-    consume_id: str
-    consumed:   bool = False
-
-
-# ── async units ───────────────────────────────────────────────────────────────
 
 class TMA:
-    def __init__(self, sir: SIR):
-        self._sir     = sir
-        self._history: List[Tuple[TMAGroup, Optional[List[Tile]]]] = []
+    def expect(self, mgr: MultiTileLoadManager, loads: List[MemLoad]) -> Stmt:
+        return mgr.async_load_global(loads)
 
-    def load(self, loads: List[MemLoad], num_consumers: int = 1) -> TMAGroup:
-        """
-        Primes empty semaphore on first use, then:
-        wait(empty) -> expect_bytes -> load_async.
-        """
-        tiles = [load.dest for load in loads]
-        mgr   = MultiTileLoadManager(self._sir._fresh("lm"), tiles, num_consumers)
+    def wait(self, mgr: MultiTileLoadManager, level: Level = Level.warpgroup) -> Stmt:
+        return mgr.wait_full(level)
 
-        self._sir._decls.append(mgr.initialize())
-        self._sir._managers.append(mgr)
+    def prime(self, mgr: MultiTileLoadManager) -> Stmt:
+        return mgr.arrive_empty()
 
-        # prime empty semaphore once before the loop so first load can proceed
-        self._sir._init_stmts.append(mgr.arrive_empty())
-
-        # wait for buffer to be empty before loading into it
-        self._sir._stmts.append(mgr.wait_empty(Level.warpgroup))
-
-        # fire the async loads
-        self._sir._stmts.append(mgr.async_load_global(loads))
-
-        # graph
-        tile_names = ", ".join(t.name for t in tiles)
-        node_id    = self._sir._fresh("tma")
-        self._sir._graph[node_id] = GraphNode(
-            id    = node_id,
-            label = f"TMA.load\\n[{tile_names}]",
-            color = "lightblue",
-        )
-        for t in tiles:
-            t_id = f"tile_{t.name}"
-            if t_id not in self._sir._graph:
-                self._sir._graph[t_id] = GraphNode(
-                    id    = t_id,
-                    label = f"shared\\n{t.name}",
-                    color = "lightyellow",
-                )
-            self._sir._graph[node_id].edges.append(t_id)
-
-        group = TMAGroup(tiles, mgr, node_id)
-        for t in tiles:
-            self._sir._pending[id(t)] = group
-        self._history.append((group, None))
-        return group
-
-    def consume(self, group: TMAGroup, level: Level = Level.warpgroup) -> List[Tile]:
-        """Emit wait_full — tiles are now ready for use."""
-        assert not group.consumed, "TMAGroup already consumed"
-        self._sir._stmts.append(group.manager.wait_full(level))
-        group.consumed = True
-        for i, (g, _) in enumerate(self._history):
-            if g is group:
-                self._history[i] = (g, group.tiles)
-                break
-        return group.tiles
-
-    def arrive_empty(self, group: TMAGroup) -> None:
-        """Signal that consumer is done — buffer can be reused by producer."""
-        self._sir._stmts.append(group.manager.arrive_empty())
+    def release(self, mgr: MultiTileLoadManager) -> Stmt:
+        return mgr.arrive_empty()
 
 
 class MMA:
-    def __init__(self, sir: SIR):
-        self._sir     = sir
-        self._last:    Optional[MMAResult] = None
-        self._history: List[Tuple[MMAResult, Optional[MMAResult]]] = []
-
-    def produce(self, a: Tile, b: Tile, out: Tile,
-                release: Optional[List[TMAGroup]] = None) -> MMAResult:
-        """
-        Emit mma_AB + async_wait.
-        release: TMAGroups to arrive_empty after MMA completes,
-                 releasing those buffers back to the producer.
-        """
-        assert self._last is None or self._last.consumed, \
-            "previous MMAResult must be consumed before producing again"
-
-        self._sir._stmts.append(OpCall("warpgroup::mma_AB", [out, a, b]).to_stmt())
-        self._sir._stmts.append(OpCall("warpgroup::mma_async_wait", []).to_stmt())
-
-        if release:
-            for grp in release:
-                self._sir._stmts.append(grp.manager.arrive_empty())
-
-        # graph
-        prod_id = self._sir._fresh("mma_prod")
-        cons_id = self._sir._fresh("mma_cons")
-        acc_id  = f"tile_{out.name}"
-
-        self._sir._graph[prod_id] = GraphNode(
-            id    = prod_id,
-            label = f"MMA.produce\\n→ {out.name}",
-            color = "orange",
-        )
-        self._sir._graph[cons_id] = GraphNode(
-            id    = cons_id,
-            label = f"MMA.consume\\n← {out.name}",
-            color = "lightgreen",
-        )
-
-        # input tiles -> produce
-        for t in [a, b]:
-            t_id = f"tile_{t.name}"
-            if t_id in self._sir._graph:
-                self._sir._graph[t_id].edges.append(prod_id)
-
-        # produce -> accum tile -> consume
-        if acc_id not in self._sir._graph:
-            self._sir._graph[acc_id] = GraphNode(
-                id    = acc_id,
-                label = f"accum\\n{out.name}",
-                color = "lightyellow",
-            )
-        self._sir._graph[prod_id].edges.append(acc_id)
-        self._sir._graph[acc_id].edges.append(cons_id)
-
-        # previous consume -> this produce (serialization dependency)
-        if self._last is not None:
-            self._sir._graph[self._last.consume_id].edges.append(prod_id)
-
-        result = MMAResult(out, prod_id, cons_id)
-        self._last = result
-        self._sir._pending[id(out)] = result
-        self._history.append((result, None))
-        return result
-
-    def consume(self, result: MMAResult) -> Tile:
-        """Returns the accumulated tile — marks result as consumed."""
-        assert not result.consumed, "MMAResult already consumed"
-        result.consumed = True
-        for i, (prod, _) in enumerate(self._history):
-            if prod is result:
-                self._history[i] = (prod, result)
-                break
-        return result.tile
-
-
-# ── SIR ───────────────────────────────────────────────────────────────────────
-
-class SIR:
     def __init__(self):
-        self._stmts:      List[Stmt] = []
-        self._decls:      List[Stmt] = []
-        self._init_stmts: List[Stmt] = []
-        self._counter:    int        = 0
-        self._managers:   List[MultiTileLoadManager] = []
-        self._pending:    dict       = {}
-        self._graph:      dict[str, GraphNode] = {}
-        self._loop_nodes: List[str]  = []
+        self._last: Optional[MMAState] = None
 
-        self.tma = TMA(self)
-        self.mma = MMA(self)
+    def issue(self, scope: Scope, a: Tile, b: Tile, out: Tile) -> MMAState:
+        if self._last and not self._last.consumed:
+            scope._emit(OpCall("warpgroup::mma_async_wait", []).to_stmt())
+            self._last.consume()
+        scope._emit(OpCall("warpgroup::mma_AB", [out, a, b]).to_stmt())
+        state = MMAState(nid=f"mma_{a.name}x{b.name}")
+        self._last = state
+        return state
 
-    def _fresh(self, prefix="t") -> str:
-        self._counter += 1
-        return f"{prefix}{self._counter}"
+    def sync(self, scope: Scope) -> None:
+        assert self._last and not self._last.consumed, "no pending MMA to sync"
+        scope._emit(OpCall("warpgroup::mma_async_wait", []).to_stmt())
+        self._last.consume()
 
-    def tile(self, tile_type) -> Tile:
-        t    = Tile(self._fresh("t"), tile_type)
-        t_id = f"tile_{t.name}"
-        self._decls.append(t.var.declare())
-        self._graph[t_id] = GraphNode(
-            id    = t_id,
-            label = f"{type(tile_type).__name__}\\n{t.name}",
-            color = "lightyellow",
-        )
-        return t
+
+class Scope(Stmt):
+    def __init__(self, sir: SIR):
+        self._sir       = sir
+        self._children: List[Stmt] = []
+
+    def _emit(self, stmt: Stmt) -> Stmt:
+        self._children.append(stmt)
+        return stmt
+
+    def __str__(self) -> str:
+        return str(SeqStmt(self._children))
+
+    def tma_load(self, loads: List[MemLoad]) -> Tuple[List[Tile], ConsumeScope]:
+        tiles = [l.dest for l in loads]
+        name  = "_".join(t.name for t in tiles)
+        mgr   = MultiTileLoadManager(f"lm_{name}", tiles)
+        self._sir._root_decls.append(mgr.initialize())
+        self._sir._pre_loop.append(self._sir.tma.prime(mgr))
+        self._emit(mgr.wait_empty(Level.warpgroup))
+        self._emit(self._sir.tma.expect(mgr, loads))
+        nid = f"tma_{name}"
+        self._sir.G.add_node(nid, label=f"TMA\n{[t.name for t in tiles]}", color="lightblue")
+        for t in tiles: self._sir.G.add_edge(nid, f"tile_{t.name}")
+        return tiles, ConsumeScope(mgr, self._sir)
+
+    def mma(self, a: Tile, b: Tile, out: Tile) -> MMAState:
+        state = self._sir.mma.issue(self, a, b, out)
+        prev  = self._sir.mma._last
+        self._sir.G.add_node(state.nid, label=f"MMA\n{a.name}x{b.name}->{out.name}", color="orange")
+        for t in [a, b]: self._sir.G.add_edge(f"tile_{t.name}", state.nid)
+        self._sir.G.add_edge(state.nid, f"tile_{out.name}")
+        return state
 
     def op(self, fn: str, *args) -> None:
-        """Pass-through for all synchronous ops."""
-        resolved = [a.tile if isinstance(a, MMAResult) else a for a in args]
-        self._stmts.append(OpCall(fn, list(resolved)).to_stmt())
-
-        op_id = self._fresh("op")
-        short = fn.split("::")[-1]
-        self._graph[op_id] = GraphNode(
-            id    = op_id,
-            label = f"{short}",
-            color = "lightgrey",
-        )
+        self._emit(OpCall(fn, list(args)).to_stmt())
+        nid = f"op_{fn.split('::')[-1]}_{len(self._sir.G)}"
+        self._sir.G.add_node(nid, label=fn.split("::")[-1], color="lightgrey")
         for a in args:
-            if isinstance(a, MMAResult):
-                self._graph[a.consume_id].edges.append(op_id)
-            elif isinstance(a, Tile):
-                t_id = f"tile_{a.name}"
-                if t_id in self._graph:
-                    self._graph[t_id].edges.append(op_id)
+            if isinstance(a, Tile) and f"tile_{a.name}" in self._sir.G:
+                self._sir.G.add_edge(f"tile_{a.name}", nid)
 
-    def loop(self, var: Var, bound: Expr, body_fn) -> None:
-        """Emit a for loop. body_fn receives a child SIR sharing state."""
-        inner = SIR()
-        inner._counter    = self._counter
-        inner._managers   = self._managers
-        inner._pending    = self._pending
-        inner._graph      = self._graph
-        inner._init_stmts = self._init_stmts
-        inner.mma._last    = self.mma._last
-        inner.mma._history = self.mma._history
-        inner.tma._history = self.tma._history
 
-        before = set(self._graph.keys())
-        body_fn(inner)
-        after  = set(inner._graph.keys())
-        self._loop_nodes = list(after - before)
+class ConsumeScope(Scope):
+    def __init__(self, mgr: MultiTileLoadManager, sir: SIR):
+        super().__init__(sir)
+        self._mgr = mgr
 
-        self._counter  = inner._counter
-        self.mma._last = inner.mma._last
-        self._decls.extend(inner._decls)
+    def __str__(self) -> str:
+        return str(SeqStmt([
+            self._sir.tma.wait(self._mgr),
+            SeqStmt(self._children),
+            self._sir.tma.release(self._mgr),
+        ]))
 
-        # emit init stmts (e.g. arrive_empty priming) before the loop
-        self._stmts.extend(self._init_stmts)
-        self._init_stmts = []
 
-        self._stmts.append(ForStmt(
-            AssignExpr(var, RawExpr(0)),
-            BinaryOp(var, bound, "<"),
-            AssignExpr(var, BinaryOp(var, RawExpr(1), "+")),
-            SeqStmt(inner._stmts)
+class LoopScope(Scope):
+    def __init__(self, var: Var, bound: Expr, sir: SIR):
+        super().__init__(sir)
+        self.i      = var
+        self._bound = bound
+
+    def __str__(self) -> str:
+        return str(ForStmt(
+            AssignExpr(self.i, RawExpr(0)),
+            BinaryOp(self.i, self._bound, "<"),
+            AssignExpr(self.i, BinaryOp(self.i, RawExpr(1), "+")),
+            SeqStmt(self._children),
         ))
 
+
+class SIR(Scope):
+    def __init__(self, tma: TMA = None, mma: MMA = None):
+        super().__init__(self)
+        self.tma          = tma or TMA()
+        self.mma          = mma or MMA()
+        self._root_decls: List[Stmt] = []
+        self._pre_loop:   List[Stmt] = []
+        self.G            = nx.DiGraph()
+
+    def tile(self, name: str, tile_type) -> Tile:
+        t = Tile(name, tile_type)
+        self._root_decls.append(t.var.declare())
+        self.G.add_node(f"tile_{name}", label=f"{type(tile_type).__name__}\n{name}", color="lightyellow")
+        return t
+
+    def add_loop(self, bound: Expr) -> Tuple[Var, LoopScope]:
+        loop = LoopScope(Var("i", ScalarType("int")), bound, self)
+        for s in self._pre_loop: self._emit(s)
+        self._pre_loop = []
+        self._emit(loop)
+        return loop.i, loop
+
+    def add_store(self, tile: Tile, dst: Var, coord: Coord) -> None:
+        self._emit(tile.warpgroup_store_global(dst, coord))
+        nid = f"store_{tile.name}"
+        self.G.add_node(nid, label=f"store\n{tile.name}", color="lightgrey")
+        self.G.add_edge(f"tile_{tile.name}", nid)
+
     def emit(self) -> Stmt:
-        return SeqStmt(self._decls + self._init_stmts + self._stmts)
+        return SeqStmt(self._root_decls + self._children)
+
+    def save_graph(self, path: str = "outputs/sir_graph.png") -> None:
+        import os; os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        G     = self.G
+        order = list(nx.topological_sort(G))
+        depth: dict = {}
+        for n in order:
+            depth[n] = max((depth[p]+1 for p in G.predecessors(n)), default=0)
+        by_layer: dict = defaultdict(list)
+        for n, d in depth.items(): by_layer[d].append(n)
+        pos = {n: (d*280, -i*150) for d, ns in by_layer.items() for i, n in enumerate(ns)}
+        fig, ax = plt.subplots(figsize=(max(14, len(by_layer)*3), 8))
+        ax.axis("off")
+        nx.draw_networkx(G, pos, ax=ax, arrows=True, font_size=8, node_size=2200,
+                         node_color=[G.nodes[n].get("color", "white") for n in G.nodes],
+                         labels={n: G.nodes[n].get("label", n) for n in G.nodes},
+                         arrowsize=20, width=1.5, connectionstyle="arc3,rad=0.08")
+        plt.tight_layout(); plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+        print(f"saved -> {path}")

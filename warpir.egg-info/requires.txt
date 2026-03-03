@@ -6,3 +6,4 @@ torchvision>=0.25.0
 torchaudio>=2.10.0
 setuptools>=82.0.0
 ninja>=1.13.0
+matplotlib>=3.10.8
