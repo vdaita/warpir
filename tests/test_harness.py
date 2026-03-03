@@ -63,7 +63,7 @@ def generate_and_test(name, program):
             sources=[out_file],
             extra_include_paths=[THUNDERKITTENS_INCLUDE_PATH],
             extra_cflags=["-O3", "-std=c++20"],
-            extra_cuda_cflags=["-O3", "-std=c++20", "--use_fast_math", "--extended-lambda", "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__"],
+            extra_cuda_cflags=["-O3", "-std=c++20", "--use_fast_math", "--extended-lambda", "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__", "-DKITTENS_HOPPER"],
             build_directory="outputs",
             verbose=False
         )

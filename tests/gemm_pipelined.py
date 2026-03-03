@@ -21,80 +21,101 @@ static constexpr int BLOCK_SIZE = {block_size_val};
         N=ScalarType("int")
     )
     
-    ab_type = sub_tile
-    accum_type = RegTileType(GPUType.fp32, 16, BLOCK_SIZE, RegTileLayout.row_major)
+    # Shared memory tiles
+    As0 = Tile("As0", sub_tile)
+    As1 = Tile("As1", sub_tile)
+    Bs0 = Tile("Bs0", sub_tile)
+    Bs1 = Tile("Bs1", sub_tile)
 
-    As = Tile("As", ab_type)
-    Bs = Tile("Bs", ab_type)
-    
-    C_accum = Tile("C_accum", accum_type)
-    C_accum_cpy = Tile("C_accum_cpy", accum_type)
+    # Register accumulator tiles
+    C_accum = Var("C_accum", RegTileType(GPUType.fp32, 16, BLOCK_SIZE, RegTileLayout.row_major))
+    C_accum_cpy = Var("C_accum_cpy", RegTileType(GPUType.fp32, 16, BLOCK_SIZE, RegTileLayout.row_major))
 
     row, col = Var("row", ScalarType("int")), Var("col", ScalarType("int"))
     num_tiles = Var("num_tiles", ScalarType("int"))
     
-    tic = Var("tic", ScalarType("int"))
-    toc = Var("toc", ScalarType("int"))
-    
+    tile = Var("tile", ScalarType("int"))
     bar = Symbol("bar")
 
-    tile = Var("tile", ScalarType("int"))
+    # Constants for the kernel
+    constants = """
+static constexpr int BLOCK_SIZE = 64;
+static constexpr int NUM_WORKERS = 4;
+static constexpr int NUM_THREADS = NUM_WORKERS * 32;
+static constexpr int NUM_WARPS = NUM_WORKERS;
+"""
+
+    # Kernel body statements
+    body = [
+        As0.declare(),
+        Bs0.declare(),
+        As1.declare(),
+        Bs1.declare(),
+        DeclStmt(row, BuiltinExpr("blockIdx.y")),
+        DeclStmt(col, BuiltinExpr("blockIdx.x")),
+        RawStmt("__shared__ semaphore bar;"),
+        IfStmt(BuiltinExpr("threadIdx.x == 0"), SeqStmt([
+            RawStmt("init_semaphore(bar, 0, 1);"),
+            OpCall("tma::expect_bytes", bar, SizeBytesOfTypeOf(As0.ref()) * 2),
+            g.A.load_async(As0.ref(), Coord(0, 0, row, 0), bar),
+            g.B.load_async(Bs0.ref(), Coord(0, 0, 0, col), bar),
+        ])),
+        OpCall("__syncthreads"),
+        OpCall("kittens::warp::zero", C_accum_cpy),
+        DeclStmt(num_tiles, (g.N + BLOCK_SIZE - 1) / BLOCK_SIZE),
+        DeclStmt(tile),
+    ]
+
+    # Straight-line loop body for pipelining
+    loop_body = SeqStmt([
+        # Wait for current tile
+        OpCall("wait", bar, BuiltinExpr("tile % 2")),
+        OpCall("__syncthreads"),
+
+        # Load NEXT tile (pipelined)
+        IfStmt(BuiltinExpr("threadIdx.x == 0 && tile+1 < num_tiles"), 
+            SeqStmt([
+                OpCall("tma::expect_bytes", bar, SizeBytesOfTypeOf(As0.ref()) * 2),
+                IfStmt(BuiltinExpr("(tile + 1) % 2 == 1"),
+                    SeqStmt([
+                        g.A.load_async(As1.ref(), Coord(0, 0, row, BuiltinExpr("tile + 1")), bar),
+                        g.B.load_async(Bs1.ref(), Coord(0, 0, BuiltinExpr("tile + 1"), col), bar),
+                    ]),
+                    SeqStmt([
+                        g.A.load_async(As0.ref(), Coord(0, 0, row, BuiltinExpr("tile + 1")), bar),
+                        g.B.load_async(Bs0.ref(), Coord(0, 0, BuiltinExpr("tile + 1"), col), bar),
+                    ])
+                )
+            ])
+        ),
+
+        # MMA for current tile
+        IfStmt(BuiltinExpr("tile % 2 == 0"),
+            OpCall("warpgroup::mma_AB", C_accum, As0.ref(), Bs0.ref()),
+            OpCall("warpgroup::mma_AB", C_accum, As1.ref(), Bs1.ref())
+        ),
+        OpCall("warpgroup::mma_async_wait"),
+        OpCall("kittens::warp::add", C_accum_cpy, C_accum_cpy, C_accum),
+        OpCall("kittens::warp::zero", C_accum),
+        OpCall("__syncthreads")
+    ])
+
     for_stmt = ForStmt(
         AssignStmt(tile, 0),
-        tile < num_tiles,
-        BuiltinExpr("++tile, tic^=1, toc^=1"),
-        SeqStmt([
-            OpCall("wait", bar, tic),
-            OpCall("__syncthreads"),
-            IfStmt(
-                BuiltinExpr("threadIdx.x == 0 && tile+1 < num_tiles"),
-                SeqStmt([
-                    OpCall("tma::expect_bytes", bar, BuiltinExpr("size_bytes<sub_tile> * 2")),
-                    OpCall("tma::load_async", "As[toc]", g.A, Coord(0, 0, row, BuiltinExpr("tile+1")), bar),
-                    OpCall("tma::load_async", "Bs[toc]", g.B, Coord(0, 0, BuiltinExpr("tile+1"), col), bar)
-                ])
-            ),
-            OpCall("warpgroup::mma_AB", C_accum, "As[tic]", "Bs[tic]"),
-            OpCall("warpgroup::mma_async_wait"),
-            OpCall("kittens::warp::add", C_accum_cpy, C_accum_cpy, C_accum),
-            OpCall("kittens::warp::zero", C_accum),
-            OpCall("__syncthreads")
-        ])
+        BuiltinExpr("tile < num_tiles"),
+        BuiltinExpr("++tile"),
+        loop_body
     )
-    store_stmt = OpCall("warpgroup::store", g.C, C_accum_cpy, Coord(0, 0, row, col))
+    body.append(for_stmt)
+    body.append(OpCall("warpgroup::store", g.C, C_accum_cpy, Coord(0, 0, row, col)))
 
     return Program(
         input_vars=[Var("A", ScalarType("bf16*")), Var("B", ScalarType("bf16*")), Var("C", ScalarType("bf16*")), Var("N", ScalarType("size_t"))], 
         kernel_vars=g, 
-        kernel_stmt=SeqStmt([
-            SharedAllocStmt("As", ab_type, count=2),
-            SharedAllocStmt("Bs", ab_type, count=2),
-            DeclStmt(tic, 0),
-            DeclStmt(toc, 1),
-            C_accum.def_(),
-            C_accum_cpy.def_(),
-            DeclStmt(row, getConst("blockIdx.y")),
-            DeclStmt(col, getConst("blockIdx.x")),
-            BuiltinExpr("__shared__ semaphore bar;"),
-            IfStmt(
-                BuiltinExpr("threadIdx.x == 0"),
-                SeqStmt([
-                    OpCall("init_semaphore", bar, 0, 1),
-                    OpCall("tma::expect_bytes", bar, BuiltinExpr("size_bytes<sub_tile> * 2")),
-                    OpCall("tma::load_async", "As[tic]", g.A, Coord(0, 0, row, 0), bar),
-                    OpCall("tma::load_async", "Bs[tic]", g.B, Coord(0, 0, 0, col), bar)
-                ])
-            ),
-            OpCall("__syncthreads"),
-            OpCall("kittens::warp::zero", C_accum_cpy),
-            DeclStmt(num_tiles, (g.N + BLOCK_SIZE - 1) / BLOCK_SIZE),
-            DeclStmt(tile),
-            for_stmt,
-            store_stmt
-        ]),
+        kernel_stmt=SeqStmt(body),
         constants=constants,
-        grid_dims="(N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE",
-        block_dims="NUM_THREADS",
+        grid_dims=Coord("(N + BLOCK_SIZE - 1) / BLOCK_SIZE", "(N + BLOCK_SIZE - 1) / BLOCK_SIZE"),
+        block_dims=Symbol("NUM_THREADS"),
         shared_mem="102400",
         launch_name="matmul"
     )

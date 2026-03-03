@@ -91,7 +91,7 @@ class Coord:
     def __str__(self) -> str:
         return "{" + ", ".join(_fmt(i) for i in self.items) + "}"
 
-class SizeBytesOfTypeOf:
+class SizeBytesOfTypeOf(ExprBase):
     def __init__(self, var):
         self.var = var
 
