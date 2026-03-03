@@ -8,7 +8,7 @@ FAILED=()
 
 # ── codegen ───────────────────────────────────────────────────────────────────
 echo "=== Generating CUDA sources ==="
-python3 "$SCRIPT_DIR/generate.py"
+uv run "$SCRIPT_DIR/generate.py"
 
 # ── compile & test ────────────────────────────────────────────────────────────
 for KERNEL in "${KERNELS[@]}"; do
