@@ -31,12 +31,12 @@ def build_gemm_kernel() -> Program:
     tile = Var("tile", ScalarType("int"))
     tile_plus_1 = BinaryOp(tile, RawExpr(1), "+")
 
-    load_manager = [MultiTileManager("lm0", [As[0], Bs[0]]), MultiTileManager("lm1", (As[1], Bs[1]))]
+    load_manager = [MultiTileLoadManager("lm0", [As[0], Bs[0]]), MultiTileLoadManager("lm1", (As[1], Bs[1]))]
 
     def statement_idx(i: int):
         return SeqStmt([
             # wait for 0,
-            load_manager[i].wait_full(),
+            load_manager[i].wait_full(Level.block),
             # load 1,
             IfStmt(
                 BinaryOp(tile_plus_1, num_tiles, "<"),

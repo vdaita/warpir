@@ -1,118 +1,112 @@
 from warpir import *
-from warpir.ops import BuiltinExpr
 
 def build_gemm_kernel() -> Program:
-    block_size_val, qsize = 64, 2
-    BLOCK_SIZE = BuiltinExpr("BLOCK_SIZE")
-    
-    constants = f"""
-static constexpr int BLOCK_SIZE = {block_size_val};
-"""
+    BLOCK_SIZE = 64
+    QSIZE = 2
+    NUM_WORKERS = 8
+    NUM_THREADS = NUM_WORKERS * 32
+    NUM_CONSUMERS = (NUM_THREADS // 128) - 1
 
-    # Define types with programmatic aliases
-    sub_tile = SharedTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE, SharedTileLayout.row_major, alias_name="sub_tile")
-    tile_gl = GlobalType(GPUType.bf16, sub_tile, w=1, x=1, y=-1, z=-1, alias_name="tile_gl")
+    shared_tile_type = SharedTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE, SharedTileLayout.row_major)
+    As = [Tile(f"As{i}", shared_tile_type) for i in range(QSIZE)]
+    Bs = [Tile(f"Bs{i}", shared_tile_type) for i in range(QSIZE)]
 
-    g = KernelGlobals(
-        name="matmul_globals",
-        A=tile_gl,
-        B=tile_gl,
-        C=tile_gl, 
-        N=ScalarType("int")
-    )
-    
-    row = getConst("blockIdx.y")
-    col = getConst("blockIdx.x")
+    global_type = GlobalType(GPUType.bf16, shared_tile_type, 1, 1, -1, -1)
+    A = Var("A", global_type)
+    B = Var("B", global_type)
+    C = Var("C", global_type)
+    N = Var("N", ScalarType("int"))
 
-    num_tiles = Var("num_tiles", ScalarType("int"))
-    warpid = Var("warpid", ScalarType("int"))
-    warpgroupid = Var("warpgroupid", ScalarType("int"))
-    num_consumers = Var("num_consumers", ScalarType("int"))
-    num_consumers_expr = BuiltinExpr("(NUM_THREADS / 128) - 1")
-    
+    kernel_globals = KernelGlobals("globals")
+    for var in [A, B, C, N]:
+        kernel_globals.add_var(var)
+
+    lms = [
+        MultiTileLoadManager(f"lm{i}", [As[i], Bs[i]], num_consumers=NUM_CONSUMERS)
+        for i in range(QSIZE)
+    ]
+
+    accum_tile_type = RegTileType(GPUType.fp32, 16, BLOCK_SIZE, RegTileLayout.row_major)
+    C_accum = Tile("C_accum", accum_tile_type)
+
+    zero = RawExpr(0)
+    col = RawExpr("blockIdx.x")
+    row = RawExpr("blockIdx.y")
+    num_tiles = BinaryOp(BinaryOp(N, RawExpr(BLOCK_SIZE - 1), "+"), RawExpr(BLOCK_SIZE), "/")
     tile = Var("tile", ScalarType("int"))
-    p = Var("p", ScalarType("int"))
-    qidx = Var("qidx", ScalarType("int"))
+
+    def producer_stmt(i: int) -> Stmt:
+        return SeqStmt([
+            lms[i].wait_empty(Level.warpgroup),
+            lms[i].async_load_global([
+                MemLoad(source=A, dest=As[i], coord=Coord([zero, zero, row, tile])),
+                MemLoad(source=B, dest=Bs[i], coord=Coord([zero, zero, tile, col]))
+            ]),
+        ])
+
+    def consumer_stmt(i: int) -> Stmt:
+        return SeqStmt([
+            lms[i].wait_full(Level.warpgroup),
+            OpCall("warpgroup::mma_AB", [C_accum, As[i], Bs[i]]).to_stmt(),
+            OpCall("warpgroup::mma_async_wait", []).to_stmt(),
+            lane0_if(ExprStmt(OpCall("arrive", [lms[i].empty_sem, RawExpr(1)]))),
+        ])
 
     producer_loop = ForStmt(
-        AssignStmt(tile, 0),
-        tile < num_tiles,
-        BuiltinExpr("++tile, ++qidx"),
-        SeqStmt([
-            IfStmt(BuiltinExpr("qidx == 2"), BuiltinExpr("qidx = 0; p ^= 1;")),
-            OpCall("wait", BuiltinExpr(f"empty[qidx]"), p),
-            OpCall("tma::expect_bytes", BuiltinExpr(f"full[qidx]"), BuiltinExpr("size_bytes<sub_tile> * 2")),
-            OpCall("tma::load_async", BuiltinExpr(f"As[qidx]"), g.A, Coord(0, 0, row, tile), BuiltinExpr("full[qidx]")),
-            OpCall("tma::load_async", BuiltinExpr(f"Bs[qidx]"), g.B, Coord(0, 0, tile, col), BuiltinExpr("full[qidx]"))
-        ])
-    )
-    
-    producer = SeqStmt([RawStmt("warpgroup::decrease_registers<32>();"),
-                        IfStmt(BuiltinExpr("warpgroup::laneid() == 0"),
-                               SeqStmt([DeclStmt(p, 0), DeclStmt(qidx, 0), producer_loop]))
-                        ])
-
-    C_accum = Var("C_accum", RegTileType(GPUType.fp32, 16, BLOCK_SIZE, RegTileLayout.row_major))
-    
-    init_arrive = ForStmt(
-        BuiltinExpr("int i = 0"),
-        BuiltinExpr(f"i < {qsize}"),
-        BuiltinExpr("++i"),
-        OpCall("arrive", BuiltinExpr("empty[i]"), 1)
+        AssignExpr(tile, zero),
+        BinaryOp(tile, num_tiles, "<"),
+        AssignExpr(tile, BinaryOp(tile, RawExpr(1), "+")),
+        IfStmt(
+            BinaryOp(BinaryOp(tile, RawExpr(QSIZE), "%"), zero, "=="),
+            producer_stmt(0),
+            producer_stmt(1),
+        )
     )
 
     consumer_loop = ForStmt(
-        AssignStmt(tile, 0),
-        tile < num_tiles,
-        BuiltinExpr("++tile, ++qidx"),
-        SeqStmt([
-            IfStmt(BuiltinExpr("qidx == 2"), BuiltinExpr("qidx = 0; p ^= 1;")),
-            OpCall("wait", BuiltinExpr(f"full[qidx]"), p),
-            OpCall("warpgroup::mma_AB", C_accum, BuiltinExpr(f"As[qidx]"), BuiltinExpr(f"Bs[qidx]")),
-            OpCall("warpgroup::mma_async_wait"),
-            IfStmt(BuiltinExpr("warpgroup::laneid() == 0"), OpCall("arrive", BuiltinExpr("empty[qidx]"), 1))
-        ])
+        AssignExpr(tile, zero),
+        BinaryOp(tile, num_tiles, "<"),
+        AssignExpr(tile, BinaryOp(tile, RawExpr(1), "+")),
+        IfStmt(
+            BinaryOp(BinaryOp(tile, RawExpr(QSIZE), "%"), zero, "=="),
+            consumer_stmt(0),
+            consumer_stmt(1),
+        )
     )
-    consumer = SeqStmt([
-        RawStmt("warpgroup::increase_registers<256>();"), DeclStmt(C_accum),
-        OpCall("kittens::warp::zero", C_accum),
-        IfStmt(BuiltinExpr("warpgroup::laneid() == 0"), init_arrive),
-        DeclStmt(p, 0), DeclStmt(qidx, 0),
-        consumer_loop, 
-        OpCall("warpgroup::store", g.C, C_accum, Coord(0, 0, row, col)),
+
+    prime_empty = lane0_if(SeqStmt([
+        ExprStmt(OpCall("arrive", [lms[i].empty_sem, RawExpr(1)]))
+        for i in range(QSIZE)
+    ]))
+
+    producer_block = SeqStmt([
+        OpCall("warpgroup::decrease_registers<32>", []).to_stmt(),
+        producer_loop,
     ])
 
-    kernel_stmt = SeqStmt([
-        SharedAllocStmt("As", sub_tile, count=qsize),
-        SharedAllocStmt("Bs", sub_tile, count=qsize),
-        DeclStmt(Var("row", ScalarType("int")), row),
-        DeclStmt(Var("col", ScalarType("int")), col),
-        DeclStmt(num_tiles, (g.N + BLOCK_SIZE - 1) / BLOCK_SIZE),
-        DeclStmt(warpid, BuiltinExpr("kittens::warpid()")), 
-        DeclStmt(warpgroupid, BuiltinExpr("warpid/4")), 
-        DeclStmt(num_consumers, num_consumers_expr),
-        BuiltinExpr(f"__shared__ semaphore full[{qsize}], empty[{qsize}];"),
-        IfStmt(BuiltinExpr("threadIdx.x == 0"), SeqStmt([
-            ForStmt(BuiltinExpr("int i = 0"), BuiltinExpr(f"i < {qsize}"), BuiltinExpr("++i"),
-                    SeqStmt([
-                        OpCall("init_semaphore", BuiltinExpr("full[i]"), 0, 1),
-                        OpCall("init_semaphore", BuiltinExpr("empty[i]"), num_consumers, 0)
-                    ]))
-        ])),
-        RawStmt("__syncthreads();"),
-        # Instead of generic dispatch, use an If/Else for warp specialised struct
-        IfStmt(BuiltinExpr("warpgroupid == 0"), producer, consumer)
+    consumer_block = SeqStmt([
+        OpCall("warpgroup::increase_registers<256>", []).to_stmt(),
+        OpCall("kittens::warp::zero", [C_accum]).to_stmt(),
+        prime_empty,
+        consumer_loop,
+        C_accum.warpgroup_store_global(C, Coord([zero, zero, row, col])),
     ])
-    return Program(
-        input_vars=[Var("A", ScalarType("bf16*")), Var("B", ScalarType("bf16*")), Var("C", ScalarType("bf16*")), Var("N", ScalarType("size_t"))], 
-        kernel_vars=g, 
-        kernel_stmt=kernel_stmt, 
-        constants=constants,
-        grid_dims="(N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE",
-        block_dims="NUM_THREADS",
-        shared_mem="102400",
-        launch_name="matmul"
+
+    body = SeqStmt(
+        [var.declare() for var in [*As, *Bs, C_accum]] +
+        [lm.initialize() for lm in lms] +
+        [
+            ExprStmt(OpCall("__syncthreads", [])),
+            tile.declare(),
+            IfStmt(
+                BinaryOp(RawExpr("warpgroupid"), zero, "=="),
+                producer_block,
+                consumer_block,
+            )
+        ]
     )
+
+    return Program(kernel_vars=kernel_globals, kernel_stmt=body)
 
 if __name__ == "__main__":
     print(emit_cpp(build_gemm_kernel()))

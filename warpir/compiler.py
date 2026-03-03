@@ -40,3 +40,6 @@ def write_cpp(program: Program, path: str | Path, pretty: bool = True) -> Path:
     path = Path(path)
     path.write_text(emit_cpp(program, pretty=pretty))
     return path
+
+def graph_program(program: Program, path: str | Path):
+    

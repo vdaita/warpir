@@ -7,6 +7,12 @@ from abc import ABC, abstractmethod
 from jinja2 import Environment
 from dataclasses import dataclass
 from .layouts import SharedTileType, ScalarType, VarType, SharedSemaphoreType, GlobalType
+from enum import Enum
+
+class Level(str, Enum):
+    warpgroup = "warpgroup"
+    block = "block"
+
 
 class Expr(ABC):
     @abstractmethod
@@ -240,7 +246,6 @@ class Tile(Var):
         assert type(dst.var_type) == GlobalType, "loads must happen from global variable sources"
         stmts: List[Stmt] = [
             ExprStmt(OpCall("kittens::warp::store", [self, dst, coord])),
-            ExprStmt(OpCall("__syncthreads", []))
         ]
         return SeqStmt(stmts)
     
@@ -248,7 +253,6 @@ class Tile(Var):
         assert type(dst.var_type) == GlobalType, "loads must happen from global variable sources"
         stmts: List[Stmt] = [
             ExprStmt(OpCall("warpgroup::store", [self, dst, coord])),
-            ExprStmt(OpCall("__syncthreads", []))
         ]
         return SeqStmt(stmts)
 
@@ -273,14 +277,12 @@ class Tile(Var):
         return SeqStmt([
             ExprStmt(OpCall("wait", [self.full_sem, self.full_tic])),
             AssignExpr(self.full_tic, BinaryOp(self.full_tic, RawExpr("1"), "^")).to_stmt(),
-            ExprStmt(OpCall("__syncthreads", []))
         ])
     
     def wait_empty(self):
         return SeqStmt([
             ExprStmt(OpCall("wait", [self.empty_sem, self.empty_tic])),
             AssignExpr(self.empty_tic, BinaryOp(self.empty_tic, RawExpr("1"), "^")).to_stmt(),
-            ExprStmt(OpCall("__syncthreads", []))
         ])
 
 @dataclass
@@ -289,7 +291,7 @@ class MemLoad:
     dest: Tile
     coord: Coord
 
-class MultiTileManager:
+class MultiTileLoadManager:
     def __init__(
         self,
         name: str,
@@ -332,19 +334,23 @@ class MultiTileManager:
         ]
         return lane0_if(SeqStmt(stmts))
 
-    def wait_full(self):
-        return SeqStmt([
+    def wait_full(self, level):
+        stmts = [
             ExprStmt(OpCall("wait", [self.full_sem, self.full_tic])),
             AssignExpr(self.full_tic, BinaryOp(self.full_tic, RawExpr("1"), "^")).to_stmt(),
-            ExprStmt(OpCall("__syncthreads", []))
-        ])
+        ]
+        if level == Level.block:
+            stmts.append(OpCall("__syncthreads", []).to_stmt())
+        return SeqStmt(stmts)
     
-    def wait_empty(self):
+    def wait_empty(self, level):
         return SeqStmt([
             ExprStmt(OpCall("wait", [self.empty_sem, self.empty_tic])),
-            AssignExpr(self.empty_tic, BinaryOp(self.empty_tic, RawExpr("1"), "^")).to_stmt(),
-            ExprStmt(OpCall("__syncthreads", []))
+            AssignExpr(self.empty_tic, BinaryOp(self.empty_tic, RawExpr("1"), "^")).to_stmt()
         ])
+        if level == Level.block:
+            stmts.append(OpCall("__syncthreads", []).to_stmt())
+        return SeqStmt(stmts)
 
 KITTENS_TEMPLATE = """
 #include <iostream>
