@@ -96,6 +96,7 @@ class RawExpr(Expr):
     
     def __str__(self) -> str:
         return self.code.rstrip()
+zero, one = RawExpr(0), RawExpr(1)
 
 class RawStmt(Stmt):
     def __init__(self, code: str):
@@ -209,7 +210,7 @@ class Tile(Var):
         self.var = Var(self.name, self.var_type)
 
         if use_semaphores:
-            self._manager = MultiTileLoadManager(name, [self], num_consumers)
+            self._manager = TileGroup(name, [self], num_consumers)
 
     def declare(self) -> Stmt:
         stmts: List[Stmt] = [self.var.declare()]
@@ -258,7 +259,7 @@ class MemLoad:
     dest: Tile
     coord: Coord
 
-class MultiTileLoadManager:
+class TileGroup:
     def __init__(
         self,
         name: str,
@@ -280,13 +281,16 @@ class MultiTileLoadManager:
         stmts.append(self.empty_sem.declare())
         stmts.append(self.full_tic.declare())
         stmts.append(self.empty_tic.declare())
-        stmts.append(AssignExpr(self.full_tic, RawExpr(0)).to_stmt())
-        stmts.append(AssignExpr(self.empty_tic, RawExpr(0)).to_stmt())
+        stmts.append(AssignExpr(self.full_tic, zero).to_stmt())
+        stmts.append(AssignExpr(self.empty_tic, zero).to_stmt())
         stmts.append(
-            thread0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, RawExpr("0"), RawExpr("1")])))
+            thread0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, zero, one])))
         )
         stmts.append(
             thread0_if(ExprStmt(OpCall("init_semaphore", [self.empty_sem, RawExpr(f"{self.num_consumers}"), RawExpr("0")])))
+        )
+        stmts.append(
+            thread0_if(ExprStmt(OpCall("arrive", [self.empty_sem, RawExpr(self.num_consumers)])))
         )
         return SeqStmt(stmts)
     
