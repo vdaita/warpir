@@ -1,4 +1,4 @@
-def pipeline(sir: SIR, n: int):
+def pipeline(DataflowGraph: DataflowGraph, n: int):
     ...
     # for each for statement, because the statements are formatted to take in i as an input, 
         # generate a version where you have i and i + 1
@@ -11,7 +11,7 @@ def pipeline(sir: SIR, n: int):
 
         # eventually, this will have to use a proper cost modek
         
-    # with this new SIR, run get_stmt()
+    # with this new DataflowGraph, run get_stmt()
 
-def warp_specialize(sir: SIR):
+def warp_specialize(DataflowGraph: DataflowGraph):
     ...
