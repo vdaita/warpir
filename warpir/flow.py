@@ -22,10 +22,26 @@ class Expr(ABC):
     def to_stmt(self):
         return ExprStmt(self)
 
+    def __eq__(self, other):
+        if not isinstance(other, Expr):
+            return False
+        return str(self) == str(other)
+
+    def __hash__(self):
+        return hash(str(self))
+
 class Stmt(ABC):
     @abstractmethod
     def __str__(self) -> str:
         pass
+
+    def __eq__(self, other):
+        if not isinstance(other, Stmt):
+            return False
+        return str(self) == str(other)
+
+    def __hash__(self):
+        return hash(str(self))
 
 _ENV = Environment(trim_blocks=True, lstrip_blocks=True)
 

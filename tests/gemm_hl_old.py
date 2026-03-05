@@ -43,7 +43,7 @@ def build_gemm_kernel() -> tuple[Program, DataflowGraph]:
     mma_wait_inst = body.mma_wait(acc)
     tma_done_inst = body.tma_done([As, Bs], [tma_consume_inst, mma_wait_inst]) # technically just needs to rely on the wait
 
-    outer.loop(tile, num_tiles, body, [acc], [acc]) # reads -> [acc], writes -> [acc]
+    outer.loop(tile, num_tiles, body, [acc], [acc, As, Bs]) # reads -> [acc], writes -> [acc]
     outer.op("warpgroup::store", parameters=[C, acc, Coord([zero, zero, row, col])], out=acc, ins=[acc])
 
     return outer.emit_program(), outer
