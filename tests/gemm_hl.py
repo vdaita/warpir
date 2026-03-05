@@ -1,5 +1,8 @@
 from warpir import *
-from warpir.dataflow_graph import DataflowGraph, MemLoad
+from warpir.dataflow_graph import DataflowGraph, MemLoad, draw_graph
+import os
+import networkx as nx
+
 
 def build_gemm_kernel() -> tuple[Program, DataflowGraph]:
     BLOCK_SIZE  = 64
@@ -17,27 +20,41 @@ def build_gemm_kernel() -> tuple[Program, DataflowGraph]:
     As  = Tile("As",  shared_type)
     Bs  = Tile("Bs",  shared_type)
     acc = Tile("acc", accum_type)
+    tile = Var("tile", ScalarType("int"))
 
-    outer = DataflowGraph(tiles=[As, Bs, acc], kernel_vars=[A, B, C, N])
-    outer.tile_op("kittens::warp::zero", parameters=[acc], output_var=acc, input_vars=[])
+    outer = DataflowGraph(kernel_globals=g)
+    outer.op("kittens::warp::zero", parameters=[acc], out=acc, ins=[])
 
-    i = Var("i", ScalarType("int"))
-
-    body = DataflowGraph(tiles=[As, Bs, acc], parent=outer, kernel_vars=[])
-    body.tma([
-        MemLoad(A, As, Coord([zero, zero, row, i])),
-        MemLoad(B, Bs, Coord([zero, zero, i,   col])),
+    body = outer.subscope()
+    body.tma_produce([
+        MemLoad(
+            source=A,
+            dest=As,
+            coord=Coord([zero, zero, row, tile])
+        ),
+        MemLoad(
+            source=B,
+            dest=Bs,
+            coord=Coord([zero, zero, tile, col])
+        )
     ])
-    body.mma(As, Bs, acc)
+    tma_consume_inst = body.tma_consume([As, Bs])
+    mma_issue_inst = body.mma_issue(acc, As, Bs, parent_instrs=[tma_consume_inst])
+    mma_wait_inst = body.mma_wait(acc)
+    tma_done_inst = body.tma_done([As, Bs], [tma_consume_inst, mma_wait_inst]) # technically just needs to rely on the wait
 
-    outer.loop("tile", num_tiles, body)
-    outer.tile_op("warpgroup::store", parameters=[C, acc, Coord([zero, zero, row, col])],
-                  output_var=acc, input_vars=[acc])
+    outer.loop(tile, num_tiles, body, [acc], [acc]) # reads -> [acc], writes -> [acc]
+    outer.op("warpgroup::store", parameters=[C, acc, Coord([zero, zero, row, col])], out=acc, ins=[acc])
 
-    return Program(kernel_vars=g, kernel_stmt=outer.get_stmt()), outer
+    return outer.emit_program(), outer
 
 
 if __name__ == "__main__":
-    from warpir.compiler import emit_cpp
-    p, DataflowGraph = build_gemm_kernel()
+    p, dataflow = build_gemm_kernel()
     print(emit_cpp(p))
+    import matplotlib.pyplot as plt
+
+    print("cycles: ", list(nx.simple_cycles(dataflow.G)))
+
+    os.makedirs("outputs", exist_ok=True)
+    draw_graph(dataflow, "outputs/graph.png")

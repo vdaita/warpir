@@ -2,10 +2,11 @@ README.md
 pyproject.toml
 warpir/__init__.py
 warpir/compiler.py
+warpir/dataflow_graph.py
 warpir/flow.py
 warpir/layouts.py
 warpir/main.py
-warpir/sir.py
+warpir/optimizer.py
 warpir.egg-info/PKG-INFO
 warpir.egg-info/SOURCES.txt
 warpir.egg-info/dependency_links.txt

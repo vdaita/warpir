@@ -170,6 +170,14 @@ class Var(Expr):
             return f"{self.parent}.{self.name}"
         return self.name
 
+    def __eq__(self, other):
+        if not isinstance(other, Var):
+            return False
+        return self.name == other.name
+
+    def __hash__(self):
+        return hash(str(self))
+
 class KernelGlobals():
     def __init__(self, name: str):
         self.vars = []
@@ -211,6 +219,17 @@ class Tile(Var):
 
         if use_semaphores:
             self._manager = TileGroup(name, [self], num_consumers)
+
+    def __str__(self):
+        return str(self.var)
+
+    def __eq__(self, other):
+        if not isinstance(other, Tile):
+            return False
+        return (self.var, self.use_semaphores, self.num_consumers) == (other.var, other.use_semaphores, other.num_consumers)
+
+    def __hash__(self):
+        return hash(str(self))
 
     def declare(self) -> Stmt:
         stmts: List[Stmt] = [self.var.declare()]
@@ -274,6 +293,17 @@ class TileGroup:
         self.empty_sem = Var(f"empty_{self.name}", SharedSemaphoreType())
         self.full_tic = Var(f"tic_full_{self.name}", ScalarType("int"))
         self.empty_tic = Var(f"tic_empty_{self.name}", ScalarType("int"))
+
+    def __str__(self):
+        return self.name
+
+    def __eq__(self, other):
+        if not isinstance(other, TileGroup):
+            return False
+        return (self.name, self.tiles, self.num_consumers) == (other.name, other.tiles, other.num_consumers)
+
+    def __hash__(self):
+        return hash(str(self))
 
     def initialize(self):
         stmts: List[Stmt] = []

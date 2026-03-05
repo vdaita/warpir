@@ -13,3 +13,5 @@ Requires-Dist: torchaudio>=2.10.0
 Requires-Dist: setuptools>=82.0.0
 Requires-Dist: ninja>=1.13.0
 Requires-Dist: matplotlib>=3.10.8
+Requires-Dist: scipy>=1.15.3
+Requires-Dist: graphviz>=0.21

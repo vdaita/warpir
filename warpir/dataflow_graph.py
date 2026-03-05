@@ -1,309 +1,266 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import List, Optional, Dict
 from .layouts import *
 from .flow import *
 import networkx as nx
-import matplotlib.pyplot as plt
 from collections import defaultdict
+import matplotlib.pyplot as plt
+from graphviz import Digraph
 
 @dataclass(frozen=True)
 class VersionedTile:
     tile: Tile
     version: int
-    context: DataflowGraph
 
-class Op(ABC):
-    @abstractmethod
-    def produce(self) -> Stmt:
-        pass
+    def __str__(self) -> str:
+        return f"{self.tile.name}@{self.version}"
 
-    @abstractmethod
-    def consume(self, stmt: Stmt) -> Stmt:
-        pass
-
-    @abstractmethod
-    def done(self) -> Stmt:
-        pass
-
-class NormalOp(Op):
-    def __init__(self, produce_stmt: Stmt):
-        self.produce_stmt = produce_stmt
-        self.was_produced = False
-
-    def produce(self):
-        if self.was_produced:
-            return NoStmt()
-        self.was_produced = True
-        return self.produce_stmt
-
-    def consume(self, stmt: Stmt):
-        return stmt
-
-    def done(self):
-        return NoStmt()
-
-# class AwaitedOp(Op):
-#     def __init__(self, normal_Op: Op, DataflowGraph: DataflowGraph):
-#         self.DataflowGraph.declarations.append(
-#             # add in the semaphore and tic/toc for this variable
-#         )
-
-class TMAOp(Op):
-    def __init__(self, group: TileGroup, loads: List[MemLoad]):
-        self.group = group
-        self.loads = loads
-
-        self.was_produced = False
-        self.was_consumed = False
-        self.was_done = False
-
-    def produce(self) -> Stmt:
-        if self.was_produced:
-            return NoStmt()
-        
-        self.was_produced = True
-        return SeqStmt([
-            self.group.wait_empty(Level.warpgroup),
-            self.group.async_load_global(self.loads)
-        ])
+    def __hash__(self):
+        return hash(str(self))
     
-    def consume(self, stmt: Stmt) -> Stmt:
-        if self.was_consumed:
-            return stmt
-        self.was_consumed = True
-        return SeqStmt([
-            self.group.wait_full(Level.warpgroup),
-            stmt
-        ])
-    
-    def done(self) -> Stmt:
-        if self.was_done:
-            return NoStmt()
-        self.was_done = True
-        return self.group.arrive_empty()
+    def __eq__(self, other):
+        if not isinstance(other, VersionedTile):
+            return False
+        return str(self) == str(other)
 
-class MMAOp(Op):
-    def __init__(self, a: Tile, b: Tile, out: Tile):
-        self.a, self.b, self.out = a, b, out
-        
-        self.was_produced = False
-        self.was_consumed = False
+@dataclass(frozen=True)
+class Instruction:
+    stmt: Stmt
+    reads: List[VersionedTile]
+    writes: List[VersionedTile]
+    name: str
 
-    def produce(self) -> Stmt:
-        if self.was_produced:
-            return NoStmt()
-        return OpCall("warpgroup::mma_AB", [self.out, self.a, self.b], to_stmt())
-    
-    def consume(self, stmt: Stmt) -> Stmt:
-        if self.was_consumed:
-            return NoStmt()
-        return SeqStmt([
-            OpCall("warpgroup::mma_AB", [self.out, self.a, self.b]).to_stmt(),
-            stmt
-        ])
+    def __hash__(self):
+        return hash(str(self) + ",".join([str(r) for r in self.reads]) + "|".join([str(w) for w in self.writes]))
 
-    def done(self) -> Stmt:
-        return NoStmt()
+    def __eq__(self, other):
+        if not isinstance(other, Instruction):
+            return False
+        return (self.name, self.reads, self.writes) == (self.name, self.reads, self.writes)
 
-class ForLoopOp(Op):
-    def __init__(self, name: str, bound: Expr, body: DataflowGraph):
-        self.name = name
-        self.bound = bound
-        self.body = body
-    
-    def produce(self) -> Stmt:
-        i = Var("i", ScalarType("int"))
-        return ForStmt(
-            AssignExpr(i, zero),
-            BinaryOp(i, self.bound, "<"),
-            AssignExpr(i, BinaryOp(i, one, "+")),
-            self.body.get_stmt()
-        )
-
-    def consume(self, stmt: Stmt) -> Stmt:
-        return stmt
-
-    def done(self) -> Stmt:
-        return NoStmt()
+    def __str__(self) -> str:
+        return f"{self.name}"
 
 class DataflowGraph:
-    def __init__(self, tiles: List[Tile], kernel_vars: List[Var], parent: DataflowGraph = None):
-        self.kernel_globals: KernelGlobals = KernelGlobals("globals")        
+    def __init__(self, kernel_globals: KernelGlobals = KernelGlobals("globals")):
         self.G = nx.DiGraph()
-        self.parent = parent
-
-        self.vtiles = [VersionedTile(tile=tile, version=0, context=self) for tile in tiles]
-        self.vars = kernel_vars
-
-        self.tile_groups = []
-
-    def write_tile(self, tile: Tile) -> VersionedTile:
-        for i, vtile in enumerate(self.vtiles):
-            if vtile.tile == tile:
-                new_vtile = VersionedTile(tile=vtile.tile, version=vtile.version + 1, context=vtile.context)
-                self.vtiles[i] = new_vtile
-                return new_vtile
-
-    def read_tile(self, tile: Tile) -> VersionedTile:
-        for vtile in self.vtiles:
-            if vtile.tile == tile:
-                return vtile
-
-    def set_kernel_globals(self, kernel_globals: KernelGlobals):
         self.kernel_globals = kernel_globals
+        self.instructions = []
 
-    def tma(self, loads: List[MemLoad]) -> List[VersionedTile]:
-        joint_name = "_".join(sorted(load.dest.name for load in loads))
-        tile_group = TileGroup(joint_name, [load.dest for load in loads])
-        if not tile_group in self.tile_groups:
-            self.tile_groups.append(tile_group)
+        self.versioned_tiles: Dict[Tile, VersionedTile] = {}
+        self.tiles: List[Tile] = []
 
-        Op = TMAOp(tile_group, loads)
-        versioned_outputs = [self.write_tile(load.dest) for load in loads]
-        for versioned_output in versioned_outputs:
-            self.G.add_Op(versioned_output, Op)
-        return [load.dest for load in loads]
+        self.parent_tile_group: Dict[Tile, TileGroup] = {}
 
-    def mma(self, a: Tile, b: Tile, out: Tile) -> Tile:
-        versioned_a = self.read_tile(a)
-        versioned_b = self.read_tile(b)
-        versioned_out_prev = self.read_tile(out)
-        versioned_out_next = self.write_tile(out)
+        self.instructions = []
 
-        Op = MMAOp(a, b, out)
-        for versioned_input in [versioned_a, versioned_b, versioned_out_prev]:
-            self.G.add_Op(versioned_input, Op)
-        self.G.add_Op(Op, versioned_out_next)
-        return out
+    def increment_version(self, tile: Tile) -> VersionedTile:
+        if not tile in self.tiles:
+            self.tiles.append(tile)
+            self.versioned_tiles[tile] = VersionedTile(
+                tile=tile,
+                version=0
+            )
+            self.G.add_node(self.versioned_tiles[tile])
         
-    def tile_op(self, op_name: str, parameters: List[Tile], output_var: Tile, input_vars: Optional[List[Tile]] = None) -> VersionedTile:
-        if not input_vars:
-            input_vars = parameters
+        self.versioned_tiles[tile] = VersionedTile(
+            tile=tile,
+            version=self.versioned_tiles[tile].version + 1
+        )
+        return self.versioned_tiles[tile]
+    
+    def current_version(self, tile: Tile) -> VersionedTile:
+        if tile not in self.versioned_tiles:
+            self.increment_version(tile)
+        return self.versioned_tiles.get(tile)
 
-        versioned_inputs = [(self.read_tile(iparam) if (type(iparam) == Tile) else iparam) for iparam in input_vars]
+    def add_instruction(self, instruction: Instruction):
+        self.instructions.append(instruction)
+        for read in instruction.reads:
+            self.G.add_edge(read, instruction)
+        for write in instruction.writes:
+            self.G.add_edge(instruction, write)
+    
+    def get_tile_group_from_list(self, tiles: List[Tile]):
+        name = "_".join(sorted(tile.name for tile in tiles))
+        return TileGroup(name, tiles)
 
-        versioned_out = self.write_tile(output_var)
+    def tma_produce(self, load: List[MemLoad]):
+        tiles = [l.dest for l in load]
+        tile_group = self.get_tile_group_from_list(tiles)
 
-        Op = NormalOp(
-            OpCall(op_name, parameters).to_stmt()
+        new_version_tiles = [self.increment_version(tile) for tile in tiles]
+        
+        for tile in tiles:
+            self.parent_tile_group[tile] = tile_group
+
+        instruction = Instruction(
+            stmt=SeqStmt([
+                tile_group.wait_empty(Level.warpgroup),
+                tile_group.async_load_global(load)
+            ]),
+            reads=[],
+            writes=new_version_tiles,
+            name=f"tma_produce_{[str(t) for t in new_version_tiles]}"
         )
 
-        for vparam in versioned_inputs:
-            if type(vparam) == VersionedTile:
-                self.G.add_Op(vparam, Op)
-        self.G.add_Op(Op, versioned_out)
+        self.add_instruction(instruction)
+        return instruction
 
-        return output_var
-        
-    def inputs(self) -> List[VersionedTile]:
-        return [
-            self.G.nodes[nid]["vtile"]
-            for nid in self.G.nodes
-            if "vtile" in self.G.nodes[nid]
-            and self.G.in_degree(nid) == 0
-        ]
-
-    def outputs(self) -> List[VersionedTile]:
-        return [
-            self.G.nodes[nid]["vtile"]
-            for nid in self.G.nodes
-            if "vtile" in self.G.nodes[nid]
-            and self.G.out_degree(nid) == 0
-        ]
-
-    def loop(self, iterator_name: str, bound: Expr, body: DataflowGraph) -> List[VersionedTile]:
-        body_inputs  = body.inputs()
-        body_outputs = body.outputs()
-
-        loop_Op = ForLoopOp(iterator_name, bound, body)
-        loop_nid  = f"loop_{id(loop_Op)}"
-        self.G.add_node(loop_nid, Op=loop_Op)
-
-        # wire parent's current tile versions into the loop
-        for vt in body_inputs:
-            parent_vt = self._read(vt.tile)
-            if parent_vt.nid not in self.G:
-                self.G.add_node(parent_vt.nid, vtile=parent_vt)
-            self.G.add_Op(parent_vt.nid, loop_nid)
-
-        # wire loop outputs to new versions in parent
-        written = []
-        for vt in body_outputs:
-            _, nxt = self._write(vt.tile)
-            self.G.add_node(nxt.nid, vtile=nxt)
-            self.G.add_Op(loop_nid, nxt.nid)
-            written.append(nxt)
-
-        return written
-
-    def get_stmt(self) -> Stmt:
-        stmts: List[Stmt] = [vt.tile.var.declare() 
-                            for vt in self.vtiles]
-        stmts += [tg.initialize() for tg in self.tile_groups]
-        seen:  set = set()
-
-        # track how many consumers each VersionedTile has
-        consumer_counts: dict[str, int] = {
-            nid: self.G.out_degree(nid)
-            for nid in self.G.nodes
-            if "vtile" in self.G.nodes[nid]
-        }
-        consumed_so_far: dict[str, int] = defaultdict(int)
-
-        def emit(s: Stmt):
-            k = str(s).strip()
-            if k and k not in seen:
-                stmts.append(s); seen.add(k)
-
-        for nid in nx.topological_sort(self.G):
-            node = self.G.nodes[nid]
-            if "Op" not in node:
-                continue
-            Op = node["Op"]
-
-            # produce: fire the op
-            emit(Op.produce())
-
-            # consume: for each input VersionedTile to this Op,
-            # emit the consume stmt and track done
-            for pred_nid in self.G.predecessors(nid):
-                pred_node = self.G.nodes[pred_nid]
-                if "vtile" not in pred_node:
-                    continue
-                pred_vt = pred_node["vtile"]
-                emit(Op.consume(NoStmt()))
-                consumed_so_far[pred_nid] += 1
-                if consumed_so_far[pred_nid] == consumer_counts[pred_nid]:
-                    emit(Op.done())
-
-        return SeqStmt(stmts)
-        # find some way to feed in "i" as a variable to the body
-        # the version of the elements on this need to be dependent on the variable "i" so that when i pipeline this, I can run a body creation method with i and i + 1 and get two separate versions
-        # then, once i produce those two versions, i can figure out how to color them in a way that properly manages the dependencies
-
-    # def get_stmt(self):
-        ...
-        # produce a topological sort of the graph
-            # there needs to be an indicator that states that you must wait for a variable to be "freed" (regardless of version) before you move on to the next version
-        
-        # add all of the new definitions that are being made in this staement
-        # create a topological sort of the instructions
-        # write a counter for each versioned tile of how many instructions feed into it (for keeping track of done)
-        
-        # for each 
-            # then, produce a list of Ops which represent what to do
-            # for each operation that is being performed, consume the incoming Ops and produce the outgoing Op
-            # if this is the last consumer of this verison of the tile, mark done
-                # mark this version as done, and so you can traverse the new Ops and add it to your topological sort to make sure that you aren't overwriting values in the middle
+    def subscope(self) -> DataflowGraph:
+        child = DataflowGraph()
+        child.versioned_tiles = self.versioned_tiles
+        child.tiles = self.tiles
+        return child
     
+    def tma_consume(self, tiles: List[Tile]) -> Instruction:
+        tile_group = self.get_tile_group_from_list(tiles)
+        for tile in tiles:
+            assert self.parent_tile_group.get(tile) == tile_group, f"TileGroup {tile_group} and parent of tile {tile} ({self.parent_tile_group.get(tile)}) must match on synchronization"
+        versioned_tiles = [self.current_version(tile) for tile in tiles]
+        instruction = Instruction(
+            stmt=SeqStmt([
+                tile_group.wait_full(Level.warpgroup)
+            ]),
+            reads=versioned_tiles,
+            writes=[],
+            name=f"tma_consume_{[str(t) for t in versioned_tiles]}"
+        )
+        self.add_instruction(instruction)
+        return instruction
 
-        # where TMA values with a particular value are produced, and where they are consumed, you should have different values
-            # when do you signal arrive(empty)? when every node of that version has already been used (you can just do TileGroup.arrive_empty())
-            # when do you do wait full? the first time that somethign from that tilegroup is touched (you can just do TileGroup.wait_full())
+    def tma_done(self, tiles: List[Tile], parent_instrs: List[Instruction] = []) -> Instruction:
+        tile_group = self.get_tile_group_from_list(tiles)
+        for tile in tiles:
+            assert self.parent_tile_group.get(tile) == tile_group, f"TileGroup {tile_group} and parent of tile {tile} ({self.parent_tile_group.get(tile)}) must match on synchronization"
+        versioned_tiles = [self.current_version(tile) for tile in tiles]
+        instruction = Instruction(
+            stmt=SeqStmt([
+                tile_group.arrive_empty()
+            ]),
+            reads=versioned_tiles,
+            writes=[],
+            name=f"tma_done_{[str(t) for t in versioned_tiles]}"
+        )
+        self.add_instruction(instruction)
+        for parent_instr in parent_instrs:
+            self.G.add_edge(parent_instr, instruction)
+        return instruction
 
-        # what does this imply? every versioned tile requires:
-            # a produce instruction -> will just be the operation that does the thing in most cases
-            # a consume instruction -> will just be the variable name in most cases
-            # and a done instruction -> will be nothing in most cases
+    def mma_issue(self, out_var: Tile, a: Tile, b: Tile, parent_instrs: List[Instruction] = []) -> Instruction:
+        versioned_a, versioned_b = self.current_version(a), self.current_version(b)
+        versioned_out, next_versioned_out = self.current_version(out_var), self.increment_version(out_var)
+
+        instruction = Instruction(
+            stmt=SeqStmt([
+                OpCall("warpgroup::mma_AB", [out_var, a, b]).to_stmt() 
+            ]),
+            reads=[versioned_a, versioned_b, versioned_out],
+            writes=[next_versioned_out],
+            name=f"mma_issue_{out_var}"
+        )
+        self.add_instruction(instruction)
+        for parent_instr in parent_instrs:
+            self.G.add_edge(parent_instr, instruction)
+        return instruction
+    
+    def mma_wait(self, out_var: Tile, parent_instrs: List[Instruction] = []) -> Instruction:
+        versioned_out = self.current_version(out_var)
+        instruction = Instruction(
+            stmt=SeqStmt([
+                OpCall("warpgroup::mma_async_wait", []).to_stmt()
+            ]),
+            reads=[versioned_out],
+            writes=[],
+            name=f"mma_wait_{out_var}"
+        )
+        self.add_instruction(instruction)
+        for parent_instr in parent_instrs:
+            self.G.add_edge(parent_instr, instruction)
+        return instruction
+
+    def op(self, name: str, parameters: List[Var], out: Tile, ins: List[Tile], parent_instrs: List[Instruction] = []) -> Instruction:
+        versioned_ins = [self.current_version(iv) for iv in ins]
+        versioned_out = self.increment_version(out)
+        instruction = Instruction(
+            stmt=SeqStmt([
+                OpCall(name, parameters).to_stmt()
+            ]),
+            reads=versioned_ins,
+            writes=[versioned_out],
+            name=f"{name}_{versioned_out}"
+        )
+        self.add_instruction(instruction)
+        for parent_instr in parent_instrs:
+            self.G.add_edge(parent_instr, instruction)
+        return instruction
+
+    def loop(self, i_var: Var, bound: Expr, body: DataflowGraph, reads: List[Tile], writes: List[Tiles], increment_expr: Optional[Expr] = None):
+        for tile in body.tiles:
+            if tile not in self.tiles:
+                self.tiles.append(tile)
+        self.versioned_tiles.update(body.versioned_tiles)
+        self.parent_tile_group.update(body.parent_tile_group)
+
+        read_versions = [self.current_version(t) for t in reads]
+
+        self.G = nx.compose(self.G, body.G)
+        instruction = Instruction(
+            stmt=SeqStmt([
+                i_var.declare(),
+                ForStmt(
+                    AssignExpr(i_var, zero),
+                    BinaryOp(i_var, bound, "<"),
+                    AssignExpr(i_var, BinaryOp(i_var, RawExpr(1), "+")) if not increment_expr else increment_expr,
+                    body.emit_stmt()
+                )
+            ]),
+            reads=read_versions,
+            writes=[self.increment_version(t) for t in writes],
+            name=f"for_loop_{i_var.name}"
+        )
+
+        self.add_instruction(instruction)
+        return instruction
+
+    def emit_stmt(self):
+        stmt_list = []
+        for instruction in self.instructions:
+            stmt_list.append(instruction.stmt)
+        return SeqStmt(stmt_list)
+
+    def emit_program(self) -> Program:
+        stmt_list = []
+
+        tg_seen = []
+        for tile in self.tiles:
+            stmt_list.append(tile.declare())
+            parent_tg = self.parent_tile_group.get(tile)
+            if parent_tg and parent_tg not in tg_seen:
+                tg_seen.append(parent_tg)
+
+        for tile_group in tg_seen:
+            stmt_list.append(tile_group.initialize())
+
+        for instruction in self.instructions:
+            stmt_list.append(instruction.stmt)
+        
+        return Program(
+            kernel_vars=self.kernel_globals,
+            kernel_stmt=SeqStmt(stmt_list)
+        )
+
+def draw_graph(graph: DataflowGraph, outpath: str):
+    dot = Digraph(graph_attr={'rankdir': 'TB', 'splines': 'ortho', 'nodesep': '0.5'})
+    dot.attr('node', shape='ellipse', style='filled', fillcolor='steelblue', 
+             fontcolor='white', fontsize='10')
+    
+    for node in graph.G.nodes():
+        dot.node(str(id(node)), label=str(node))
+    
+    for u, v in graph.G.edges():
+        dot.edge(str(id(u)), str(id(v)))
+    
+    dot.render(outpath.replace('.png', ''), format='png', cleanup=True)
