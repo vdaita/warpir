@@ -9,6 +9,13 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 from graphviz import Digraph
 import copy
+from enum import Enum
+
+
+class Resource(str, Enum):
+    TMA = "TMA"
+    MMA = "MMA"
+    CUDA = "CUDA"
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +54,11 @@ class Operation(ABC):
     def latency(self) -> int:
         """Approximate pipeline latency (used by the cost-model scheduler)."""
 
+    @property
+    @abstractmethod
+    def resource(self) -> Resource:
+        """The hardware resource used by this operation."""
+
 
 class TMAOperation(Operation):
     """Tensor Memory Accelerator async load operation.
@@ -63,6 +75,10 @@ class TMAOperation(Operation):
     @property
     def latency(self) -> int:
         return 12  # TMA loads have ~3x longer latency than MMA
+
+    @property
+    def resource(self) -> Resource:
+        return Resource.TMA
 
     def produce(self, graph: 'DataflowGraph',
                 parent_instrs: List['Instruction'] = []) -> 'Instruction':
@@ -99,6 +115,7 @@ class TMAOperation(Operation):
             reads=versioned_tiles,
             writes=[],
             name=f"tma_consume_{[str(t) for t in versioned_tiles]}",
+            source_op=self,
         )
         graph.add_instruction(instruction)
         for parent_instr in parent_instrs:
@@ -119,6 +136,7 @@ class TMAOperation(Operation):
             reads=versioned_tiles,
             writes=[],
             name=f"tma_done_{[str(t) for t in versioned_tiles]}",
+            source_op=self,
         )
         graph.add_instruction(instruction)
         for parent_instr in parent_instrs:
@@ -143,6 +161,10 @@ class MMAOperation(Operation):
     def latency(self) -> int:
         return 4  # MMA is the most expensive operation
 
+    @property
+    def resource(self) -> Resource:
+        return Resource.MMA
+
     def produce(self, graph: 'DataflowGraph',
                 parent_instrs: List['Instruction'] = []) -> 'Instruction':
         versioned_a  = graph.current_version(self.a)
@@ -156,6 +178,7 @@ class MMAOperation(Operation):
             reads=[versioned_a, versioned_b, versioned_out],
             writes=[next_versioned_out],
             name=f"mma_issue_{self.out_var}",
+            source_op=self,
         )
         graph.add_instruction(instruction)
         for parent_instr in parent_instrs:
@@ -172,6 +195,7 @@ class MMAOperation(Operation):
             reads=[versioned_out],
             writes=[],
             name=f"mma_wait_{self.out_var}",
+            source_op=self,
         )
         graph.add_instruction(instruction)
         for parent_instr in parent_instrs:
@@ -202,6 +226,10 @@ class CUDAOperation(Operation):
     def latency(self) -> int:
         return 1
 
+    @property
+    def resource(self) -> Resource:
+        return Resource.CUDA
+
     def produce(self, graph: 'DataflowGraph',
                 parent_instrs: List['Instruction'] = []) -> 'Instruction':
         versioned_ins = [graph.current_version(iv) for iv in self.ins]
@@ -211,6 +239,7 @@ class CUDAOperation(Operation):
             reads=versioned_ins,
             writes=[versioned_out],
             name=f"{self.name}_{versioned_out}",
+            source_op=self,
         )
         graph.add_instruction(instruction)
         for parent_instr in parent_instrs:
@@ -257,6 +286,12 @@ class Instruction:
     # The Operation object that issued this instruction.  Stored so the
     # pipeline optimizer can recreate the operation on different tiles/coords.
     source_op: Optional[Any]  = field(default=None, compare=False, hash=False)
+
+    @property
+    def resource(self) -> Optional[Resource]:
+        if self.source_op and hasattr(self.source_op, 'resource'):
+            return self.source_op.resource
+        return None
 
     def __hash__(self):
         return hash(str(self) + ",".join([str(r) for r in self.reads]) + "|".join([str(w) for w in self.writes]))
@@ -312,7 +347,7 @@ def substitute_stmt(stmt: Stmt, find: Expr, replace: Expr) -> Stmt:
         return AssignExpr(
             substitute_expr(stmt.lhs, find, replace),
             substitute_expr(stmt.rhs, find, replace)
-        )
+        ).to_stmt()
     else:
         return stmt
 
@@ -463,6 +498,57 @@ class DataflowGraph:
                             G_i.add_edge(writer, instr)
         return G_i
 
+    def get_unversioned_graph(self) -> nx.DiGraph:
+        """Return a DiGraph with versions stripped, containing only Instruction nodes.
+        
+        Collapses all versions of the same Tile into a single node. Instructions
+        are connected if one writes a Tile that another reads, making loops and
+        cyclic dependencies obvious for modulo scheduling analysis.
+        """
+        G_u = nx.DiGraph()
+        
+        # Add only Instruction nodes
+        instrs = [n for n in self.G.nodes() if isinstance(n, Instruction)]
+        G_u.add_nodes_from(instrs)
+        
+        # Add edges between instructions based on tile dependencies
+        for instr in instrs:
+            # Get the unversioned tiles this instruction writes
+            written_tiles = set(vt.tile for vt in instr.writes)
+            
+            # Find all other instructions that read these tiles
+            for other_instr in instrs:
+                if instr != other_instr:
+                    read_tiles = set(vt.tile for vt in other_instr.reads)
+                    if written_tiles & read_tiles:  # If there's overlap
+                        latency = instr.source_op.latency if instr.source_op else 0
+                        G_u.add_edge(instr, other_instr, distance=latency)
+        
+        return G_u
+
+    def get_reads(self):
+        # what is the first version of eveyrthing that this reads
+        seen_tiles: List[Tile] = []
+        input_versioned_tiles: List[VersionedTile] = []
+        for instruction in self.instructions:
+            for vtile in instruction.read_tiles:
+                if vtile.tile in seen_tiles:
+                    continue
+                seen_tiles.append(vtile.tile)
+                input_versioned_tiles.append(vtile)
+        return input_versioned_tiles
+
+    def get_writes(self):
+        seen_tiles: List[Tile] = []
+        output_versioned_tiles: List[VersionedTile] = []
+        for instruction in self.instructions[::-1]:
+            for vtile in instruction.write_tiles:
+                if vtile.tile in seen_tiles:
+                    continue
+                seen_tiles.append(vtile.tile)
+                output_versioned_tiles.append(vtile)
+        return output_versioned_tiles
+        
 def draw_graph(graph: DataflowGraph, outpath: str):
     dot = Digraph(graph_attr={'rankdir': 'TB', 'splines': 'ortho', 'nodesep': '0.5'})
     dot.attr('node', shape='ellipse', style='filled', fillcolor='steelblue', 
