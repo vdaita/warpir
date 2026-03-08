@@ -15,3 +15,5 @@ Requires-Dist: ninja>=1.13.0
 Requires-Dist: matplotlib>=3.10.8
 Requires-Dist: scipy>=1.15.3
 Requires-Dist: graphviz>=0.21
+Requires-Dist: ortools>=9.15.6755
+Requires-Dist: rich>=14.3.3

@@ -16,6 +16,8 @@ dependencies = [
     "matplotlib>=3.10.8",
     "scipy>=1.15.3",
     "graphviz>=0.21",
+    "ortools>=9.15.6755",
+    "rich>=14.3.3",
 ]
 
 [build-system]
