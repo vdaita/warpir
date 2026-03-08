@@ -31,7 +31,7 @@ def build_gemm_kernel() -> Program:
     tile = Var("tile", ScalarType("int"))
     tile_plus_1 = BinaryOp(tile, RawExpr(1), "+")
 
-    load_manager = [MultiTileLoadManager("lm0", [As[0], Bs[0]]), MultiTileLoadManager("lm1", (As[1], Bs[1]))]
+    load_manager = [TileGroup("lm0", [As[0], Bs[0]]), TileGroup("lm1", (As[1], Bs[1]))]
 
     def statement_idx(i: int):
         return SeqStmt([

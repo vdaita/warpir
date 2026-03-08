@@ -22,7 +22,7 @@ def build_gemm_kernel() -> Program:
         kernel_globals.add_var(var)
 
     lms = [
-        MultiTileLoadManager(f"lm{i}", [As[i], Bs[i]], num_consumers=NUM_CONSUMERS)
+        TileGroup(f"lm{i}", [As[i], Bs[i]], num_consumers=NUM_CONSUMERS)
         for i in range(QSIZE)
     ]
 

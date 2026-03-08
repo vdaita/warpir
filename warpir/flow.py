@@ -22,10 +22,26 @@ class Expr(ABC):
     def to_stmt(self):
         return ExprStmt(self)
 
+    def __eq__(self, other):
+        if not isinstance(other, Expr):
+            return False
+        return str(self) == str(other)
+
+    def __hash__(self):
+        return hash(str(self))
+
 class Stmt(ABC):
     @abstractmethod
     def __str__(self) -> str:
         pass
+
+    def __eq__(self, other):
+        if not isinstance(other, Stmt):
+            return False
+        return str(self) == str(other)
+
+    def __hash__(self):
+        return hash(str(self))
 
 _ENV = Environment(trim_blocks=True, lstrip_blocks=True)
 
@@ -96,6 +112,7 @@ class RawExpr(Expr):
     
     def __str__(self) -> str:
         return self.code.rstrip()
+zero, one = RawExpr(0), RawExpr(1)
 
 class RawStmt(Stmt):
     def __init__(self, code: str):
@@ -169,6 +186,14 @@ class Var(Expr):
             return f"{self.parent}.{self.name}"
         return self.name
 
+    def __eq__(self, other):
+        if not isinstance(other, Var):
+            return False
+        return self.name == other.name
+
+    def __hash__(self):
+        return hash(str(self))
+
 class KernelGlobals():
     def __init__(self, name: str):
         self.vars = []
@@ -209,7 +234,18 @@ class Tile(Var):
         self.var = Var(self.name, self.var_type)
 
         if use_semaphores:
-            self._manager = MultiTileLoadManager(name, [self], num_consumers)
+            self._manager = TileGroup(name, [self], num_consumers)
+
+    def __str__(self):
+        return str(self.var)
+
+    def __eq__(self, other):
+        if not isinstance(other, Tile):
+            return False
+        return (self.var, self.use_semaphores, self.num_consumers) == (other.var, other.use_semaphores, other.num_consumers)
+
+    def __hash__(self):
+        return hash(str(self))
 
     def declare(self) -> Stmt:
         stmts: List[Stmt] = [self.var.declare()]
@@ -258,7 +294,7 @@ class MemLoad:
     dest: Tile
     coord: Coord
 
-class MultiTileLoadManager:
+class TileGroup:
     def __init__(
         self,
         name: str,
@@ -274,19 +310,33 @@ class MultiTileLoadManager:
         self.full_tic = Var(f"tic_full_{self.name}", ScalarType("int"))
         self.empty_tic = Var(f"tic_empty_{self.name}", ScalarType("int"))
 
+    def __str__(self):
+        return self.name
+
+    def __eq__(self, other):
+        if not isinstance(other, TileGroup):
+            return False
+        return (self.name, self.tiles, self.num_consumers) == (other.name, other.tiles, other.num_consumers)
+
+    def __hash__(self):
+        return hash(str(self))
+
     def initialize(self):
         stmts: List[Stmt] = []
         stmts.append(self.full_sem.declare())
         stmts.append(self.empty_sem.declare())
         stmts.append(self.full_tic.declare())
         stmts.append(self.empty_tic.declare())
-        stmts.append(AssignExpr(self.full_tic, RawExpr(0)).to_stmt())
-        stmts.append(AssignExpr(self.empty_tic, RawExpr(0)).to_stmt())
+        stmts.append(AssignExpr(self.full_tic, zero).to_stmt())
+        stmts.append(AssignExpr(self.empty_tic, zero).to_stmt())
         stmts.append(
-            thread0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, RawExpr("0"), RawExpr("1")])))
+            thread0_if(ExprStmt(OpCall("init_semaphore", [self.full_sem, zero, one])))
         )
         stmts.append(
             thread0_if(ExprStmt(OpCall("init_semaphore", [self.empty_sem, RawExpr(f"{self.num_consumers}"), RawExpr("0")])))
+        )
+        stmts.append(
+            thread0_if(ExprStmt(OpCall("arrive", [self.empty_sem, RawExpr(self.num_consumers)])))
         )
         return SeqStmt(stmts)
     
