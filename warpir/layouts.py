@@ -87,6 +87,13 @@ class ScalarType:
     def __str__(self):
         return self.name
 
+class SharedSemaphoreType:
+    def __init__(self):
+        pass
+
+    def __str__(self):
+        return "semaphore"
+
 VarType = Union[
     GlobalType,
     SharedTileType,
@@ -94,26 +101,5 @@ VarType = Union[
     SharedVecType,
     RegVecType,
     ScalarType,
-    str,
+    SharedSemaphoreType
 ]
-
-class Var():
-    def __init__(self, name: str, var_type: VarType):
-        self.name = name
-        self.var_type = var_type
-    
-    def define(self):
-        t = self.var_type
-        if hasattr(t, 'alias_name') and t.alias_name:
-            return f"{t.alias_name} {self.name};"
-        return f"{self.var_type} {self.name};"
-    
-    def use(self):
-        return self.name
-
-    def __str__(self):
-        return self.name
-
-from .ops import ExprBase
-for name in ["__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__", "__div__", "__truediv__", "__mod__", "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"]:
-    setattr(Var, name, getattr(ExprBase, name))

@@ -56,7 +56,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         // arrive memory 
         wait(bar, tic);
         __syncthreads();
-
         // load next 
         if (threadIdx.x == 0 && tile+1 < num_tiles) { 
             tma::expect_bytes(
