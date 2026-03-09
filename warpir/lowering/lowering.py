@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from warpir_v2.ir.ops import (
+from warpir.ir.ops import (
     ForOp,
     Kernel,
     MMAOp,
@@ -12,7 +12,7 @@ from warpir_v2.ir.ops import (
     YieldOp,
     ZeroOp,
 )
-from warpir_v2.ir.types import (
+from warpir.ir.types import (
     GPUType,
     GlobalType,
     IntType,

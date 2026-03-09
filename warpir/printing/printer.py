@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from warpir_v2.ir.ops import (
+from warpir.ir.ops import (
     ForOp,
     Kernel,
     MMAOp,

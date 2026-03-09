@@ -9,7 +9,7 @@ sys.path.insert(0,
     )
 )
 
-from warpir_v2.ir import (
+from warpir.ir import (
     ForOp,
     GPUType,
     GlobalType,
@@ -90,8 +90,8 @@ def build_gemm_kernel() -> Kernel:
 
 if __name__ == "__main__":
     from pathlib import Path
-    from warpir_v2.printing import print_kernel
-    from warpir_v2.lowering import ThunderKittensLowerer
+    from warpir.printing import print_kernel
+    from warpir.lowering import ThunderKittensLowerer
 
     kernel = build_gemm_kernel()
 
