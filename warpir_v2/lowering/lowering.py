@@ -39,6 +39,7 @@ class ThunderKittensLowerer:
         self._sem_counter = 0
         self._wait_group_sems: dict[frozenset[str], str] = {}
         self._load_to_sem: dict[str, str] = {}
+        self._shared_tiles: list[tuple[str, SharedTileType]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -53,14 +54,15 @@ class ThunderKittensLowerer:
         self._build_aliases(kernel.body)
         self._analyze_semaphores(kernel.body)
 
-        decls = self._collect_declarations(kernel)
+        reg_decls = self._collect_reg_declarations(kernel)
+        shared_alloc_lines = self._collect_shared_allocations(kernel)
         sem_decls = self._emit_sem_decls()
         body_lines = self._lower_ops(kernel.body, depth=1)
 
-        return self._assemble(kernel, decls, sem_decls, body_lines)
+        return self._assemble(kernel, reg_decls, shared_alloc_lines, sem_decls, body_lines)
 
     # ------------------------------------------------------------------
-    # Alias resolution (SSA iter_args → single mutable variable)
+    # Alias resolution (SSA iter_args -> single mutable variable)
     # ------------------------------------------------------------------
 
     def _build_aliases(self, ops: tuple[Op, ...]) -> None:
@@ -154,30 +156,57 @@ class ThunderKittensLowerer:
     # Variable declarations
     # ------------------------------------------------------------------
 
-    def _collect_declarations(self, kernel: Kernel) -> list[str]:
+    def _collect_reg_declarations(self, kernel: Kernel) -> list[str]:
+        """Collect register tile and scalar declarations (NOT shared tiles)."""
         decls: list[str] = []
         declared: set[str] = set()
 
-        def try_decl(name: str, typ: TypeRef, shared: bool = False) -> None:
+        def try_decl(name: str, typ: TypeRef) -> None:
             resolved = self._resolve(name)
             if resolved in declared or resolved in self._globals or resolved in self.BUILTINS:
                 return
             declared.add(resolved)
-            prefix = "__shared__ " if shared else ""
-            decls.append(f"{prefix}{self._render_tk_type(typ)} {resolved};")
+            decls.append(f"{self._render_tk_type(typ)} {resolved};")
 
         def walk(ops: tuple[Op, ...]) -> None:
             for op in ops:
                 if isinstance(op, ZeroOp):
                     try_decl(op.result.name, op.result.type)
-                elif isinstance(op, TMALoadOp):
-                    try_decl(op.result.name, op.result.type, shared=True)
                 elif isinstance(op, ForOp):
                     try_decl(op.induction_var.name, op.induction_var.type)
                     walk(op.body)
 
         walk(kernel.body)
         return decls
+
+    def _collect_shared_allocations(self, kernel: Kernel) -> list[str]:
+        """Collect shared tiles and emit dynamic shared memory allocation."""
+        self._shared_tiles = []
+        declared: set[str] = set()
+
+        def walk(ops: tuple[Op, ...]) -> None:
+            for op in ops:
+                if isinstance(op, TMALoadOp):
+                    resolved = self._resolve(op.result.name)
+                    if resolved not in declared:
+                        declared.add(resolved)
+                        self._shared_tiles.append((resolved, op.result.type))  # type: ignore[arg-type]
+                elif isinstance(op, ForOp):
+                    walk(op.body)
+
+        walk(kernel.body)
+
+        if not self._shared_tiles:
+            return []
+
+        lines: list[str] = [
+            "extern __shared__ alignment_dummy __shm[];",
+            "shared_allocator al((int*)&__shm[0]);",
+        ]
+        for name, typ in self._shared_tiles:
+            tk_type = self._render_tk_type(typ)
+            lines.append(f"{tk_type} &{name} = al.allocate<{tk_type}>();")
+        return lines
 
     def _emit_sem_decls(self) -> list[str]:
         lines: list[str] = []
@@ -199,7 +228,8 @@ class ThunderKittensLowerer:
     def _assemble(
         self,
         kernel: Kernel,
-        decls: list[str],
+        reg_decls: list[str],
+        shared_alloc_lines: list[str],
         sem_decls: list[str],
         body_lines: list[str],
     ) -> str:
@@ -216,11 +246,13 @@ class ThunderKittensLowerer:
             f"__global__ void {kernel.name}"
             "(const __grid_constant__ global_vars globals) {"
         )
-        for d in decls:
+        for line in shared_alloc_lines:
+            L.append(f"  {line}")
+        for d in reg_decls:
             L.append(f"  {d}")
         for s in sem_decls:
             L.append(f"  {s}")
-        if decls or sem_decls:
+        if reg_decls or shared_alloc_lines or sem_decls:
             L.append("")
         L.extend(body_lines)
         L.append("}")
@@ -263,7 +295,7 @@ class ThunderKittensLowerer:
             ]
             expect_expr = " + ".join(expect_parts)
 
-            lines.append(f"{pad}if (warpgroup::laneid() == 0) {{")
+            lines.append(f"{pad}if (threadIdx.x == 0) {{")
             lines.append(f"{pad1}tma::expect_bytes({sem}, {expect_expr});")
             for ld in group_loads:
                 result = self._val_name(ld.result)

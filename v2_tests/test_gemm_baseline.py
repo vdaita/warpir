@@ -16,6 +16,7 @@ TK_INCLUDE = str(WARPIR_ROOT / "thunderkittens" / "include")
 
 BLOCK_SIZE = 64
 NUM_THREADS = 128  # 1 warpgroup = 4 warps * 32 threads
+DYNAMIC_SMEM_BYTES = 100000  # generous upper bound, matches TK educational kernels
 
 LAUNCH_WRAPPER = f"""
 void launch_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
@@ -25,8 +26,16 @@ void launch_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
     tile_gl b_gl{{(bf16*)B.data_ptr(), nullptr, nullptr, N, N}};
     tile_gl c_gl{{(bf16*)C.data_ptr(), nullptr, nullptr, N, N}};
     global_vars g{{a_gl, b_gl, (int)N, c_gl}};
-    dim3 grid(N / {BLOCK_SIZE}, N / {BLOCK_SIZE});
-    gemm<<<grid, {NUM_THREADS}>>>(g);
+    dim3 grid((N + {BLOCK_SIZE} - 1) / {BLOCK_SIZE}, (N + {BLOCK_SIZE} - 1) / {BLOCK_SIZE});
+    unsigned long mem_size = {DYNAMIC_SMEM_BYTES};
+    cudaDeviceSynchronize();
+    cudaFuncSetAttribute(gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    gemm<<<grid, {NUM_THREADS}, mem_size>>>(g);
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) {{
+        throw std::runtime_error(std::string("CUDA launch error: ") + cudaGetErrorString(err));
+    }}
+    cudaDeviceSynchronize();
 }}
 """
 
