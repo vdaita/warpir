@@ -1,127 +1,111 @@
 import sys
 import os
 
-sys.path.insert(0, 
-  os.path.dirname(
+sys.path.insert(0,
     os.path.dirname(
-      os.path.abspath(__file__)
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
     )
-  )
 )
 
 from warpir_v2.ir import (
-    CallOp,
-    ExprArg,
     ForOp,
     GPUType,
     GlobalType,
-    RegTileLayout,
-    RegTileType,
-    Kernel,
-    Param,
     IntType,
-    ScalarType,
-    SeqOp,
-    SharedTileLayout,
+    IterArg,
+    Kernel,
+    MMAOp,
+    RegTileType,
     SharedTileType,
+    TMALoadOp,
+    TMAStoreOp,
     Value,
+    WaitOp,
+    YieldOp,
+    ZeroOp,
 )
-from warpir_v2.lowering import ThunderKittensLowerer
 
 
-def gen_gemm_baseline() -> Kernel:
-    block_size = 32
-    shared_bf16_tile = SharedTileType(
-        data_type=GPUType.bf16,
-        rows=block_size,
-        cols=block_size,
-        layout=SharedTileLayout.row_major,
-    )
+def build_gemm_kernel() -> Kernel:
+    BLOCK_SIZE = 64
+    WARPGROUP_ROWS = 16  # each warp holds 1/4 of the tile
+
+    shared_tile = SharedTileType(GPUType.bf16, BLOCK_SIZE, BLOCK_SIZE)
     global_type = GlobalType(
         data_type=GPUType.bf16,
-        sub_tile_type=shared_bf16_tile,
-        batch=1,
-        depth=1,
-        rows=-1,
-        cols=-1,
+        sub_tile_type=shared_tile,
+        batch=1, depth=1, rows=-1, cols=-1,
     )
-    reg_bf16_row = RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.row_major)
-    reg_bf16_col = RegTileType(GPUType.bf16, block_size, block_size, RegTileLayout.col_major)
-    reg_fp32_row = RegTileType(GPUType.fp32, block_size, block_size, RegTileLayout.row_major)
-    coord_type = ScalarType("coord")
+    accum_reg = RegTileType(GPUType.fp32, WARPGROUP_ROWS, BLOCK_SIZE)
 
-    as_val = Value("As", shared_bf16_tile)
-    bs_val = Value("Bs", shared_bf16_tile)
-    a_reg_val = Value("A_reg", reg_bf16_row)
-    b_reg_val = Value("B_reg", reg_bf16_row)
-    b_reg_col_val = Value("B_reg_col", reg_bf16_col)
-    c_accum_val = Value("C_accum", reg_fp32_row)
-    tile_iter = Value("tile", IntType())
+    # Kernel I/O
+    A = Value("A", global_type)
+    B = Value("B", global_type)
+    C_global = Value("C_global", global_type)
+    N = Value("N", IntType())
+
+    # Grid built-ins
+    row = Value("blockIdx.y", IntType())
+    col = Value("blockIdx.x", IntType())
+
+    # SSA values
+    c_init = Value("c_init", accum_reg)
+    c_accum = Value("c_accum", accum_reg)    # block arg inside loop
+    c_final = Value("c_final", accum_reg)    # result after loop
+    i = Value("i", IntType())
+    a_shared = Value("a_shared", shared_tile)
+    b_shared = Value("b_shared", shared_tile)
+    c_new = Value("c_new", accum_reg)
 
     return Kernel(
-        name="kernel",
-        params=(
-            Param("A", global_type),
-            Param("B", global_type),
-            Param("C", global_type),
-            Param("N", IntType()),
-        ),
-        body=SeqOp(
-            (
-                CallOp("kittens::warp::zero", (c_accum_val,)),
-                ForOp(
-                    iter_value=tile_iter,
-                    start=ExprArg("0", IntType()),
-                    stop=ExprArg("(((globals.N + 32) + 1) / 32)", IntType()),
-                    step=ExprArg("1", IntType()),
-                    body=SeqOp(
-                        (
-                            CallOp(
-                                "kittens::warp::load",
-                                (
-                                    as_val,
-                                    ExprArg("globals.A", global_type),
-                                    ExprArg("{0, 0, blockIdx.y, tile}", coord_type),
-                                ),
-                            ),
-                            CallOp("__syncthreads", ()),
-                            CallOp(
-                                "kittens::warp::load",
-                                (
-                                    bs_val,
-                                    ExprArg("globals.B", global_type),
-                                    ExprArg("{0, 0, blockIdx.y, tile}", coord_type),
-                                ),
-                            ),
-                            CallOp("__syncthreads", ()),
-                            CallOp("kittens::warp::load", (a_reg_val, as_val)),
-                            CallOp("__syncthreads", ()),
-                            CallOp("kittens::warp::load", (b_reg_val, bs_val)),
-                            CallOp("__syncthreads", ()),
-                            CallOp("kittens::warp::swap_layout", (b_reg_col_val, b_reg_val)),
-                            CallOp("__syncthreads", ()),
-                            CallOp("kittens::warp::mma_AB", (c_accum_val, a_reg_val, b_reg_col_val, c_accum_val)),
-                            CallOp("__syncthreads", ()),
-                        )
-                    ),
+        name="gemm",
+        inputs=(A, B, N),
+        outputs=(C_global,),
+        body=(
+            ZeroOp(result=c_init),
+            ForOp(
+                induction_var=i,
+                start=0,
+                stop=N,
+                step=1,
+                tile_size=BLOCK_SIZE,
+                iter_args=(
+                    IterArg(block_arg=c_accum, init=c_init),
                 ),
-                CallOp(
-                    "kittens::warp::store",
-                    (
-                        c_accum_val,
-                        ExprArg("globals.C", global_type),
-                        ExprArg("{0, 0, blockIdx.y, blockIdx.x}", coord_type),
-                    ),
+                body=(
+                    TMALoadOp(result=a_shared, source=A, coords=(0, 0, row, i)),
+                    TMALoadOp(result=b_shared, source=B, coords=(0, 0, i, col)),
+                    WaitOp(values=(a_shared, b_shared)),
+                    MMAOp(result=c_new, a=a_shared, b=b_shared, accum=c_accum),
+                    YieldOp(values=(c_new,)),
                 ),
-            )
+                results=(c_final,),
+            ),
+            TMAStoreOp(source=c_final, dest=C_global, coords=(0, 0, row, col)),
         ),
     )
-
-
-def main():
-    kernel = gen_gemm_baseline()
-    print(ThunderKittensLowerer().lower(kernel))
 
 
 if __name__ == "__main__":
-    main()
+    from pathlib import Path
+    from warpir_v2.printing import print_kernel
+    from warpir_v2.lowering import ThunderKittensLowerer
+
+    kernel = build_gemm_kernel()
+
+    print("=== IR ===")
+    print_kernel(kernel)
+    print()
+
+    lowerer = ThunderKittensLowerer()
+    cuda_src = lowerer.lower(kernel)
+
+    print("=== ThunderKittens CUDA ===")
+    print(cuda_src)
+
+    out_path = Path(__file__).parent / "outputs" / "gemm_baseline.cu"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(cuda_src)
+    print(f"Wrote {out_path}")
