@@ -23,7 +23,7 @@ class WAInstructionManager:
     
     def add_instruction(self, instruction: WAInstruction):
         self.instructions.append(instruction)
-    def solve(self, max_cycles: int, num_warps: int, synchronization_cost: int, use_verbose=False):
+    def solve(self, max_cycles: int, num_warps: int, synchronization_cost: int, instructions: List[WAInstruction], use_verbose=False):
         model = cp_model.CpModel()
     
         warp_assignments: Dict[str, List[cp_model.BoolVarT]] = {}
@@ -86,7 +86,12 @@ class WAInstructionManager:
                     )
                 )
             model.add_no_overlap(optional_intervals)
-        
+            # if both are active, one must start after the other
+            # for interval_index in range(len(optional_intervals) - 1):
+            #     curr, next = optional_intervals[interval_index], optional_intervals[interval_index + 1]
+            #     model.add(curr.start_expr() > next.start_expr()).only_enforce_if(curr.presence_literals() + next.presence_literals())
+                
+            
         makespan = model.new_int_var(0, max_cycles - 1, "makespan")
         for instr in self.instructions:
             key = str(instr)
@@ -110,9 +115,12 @@ class WAInstructionManager:
                 start_time = solver.value(self.intervals[instruction_id].start_expr())
                 
                 warp_instructions[assigned_warp].append((f"{instruction.name}@{instruction.version}", start_time))
+        else:
+            print("INFEASIBLE!")
         
         for warp_id in range(num_warps):
             print("Warp id: ", warp_id)
+            warp_instructions[warp_id].sort(key=lambda x: x[1])
             for instruction in warp_instructions[warp_id]:
                 print("\t", instruction)
             
@@ -120,7 +128,7 @@ if __name__ == "__main__":
     manager = WAInstructionManager()
     max_cycles = 100
     num_warps = 2
-    synchronization_cost = 5
+    synchronization_cost = 100
     use_verbose = False
     
     def generate_load_instruction(name: str, version: int):
@@ -155,4 +163,4 @@ if __name__ == "__main__":
     for instruction in instructions:
         manager.add_instruction(instruction)
     
-    manager.solve(max_cycles, num_warps, synchronization_cost, use_verbose=use_verbose)
+    manager.solve(max_cycles, num_warps, synchronization_cost, instructions, use_verbose=use_verbose)
