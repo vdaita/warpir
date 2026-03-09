@@ -11,3 +11,4 @@ outputs/
 thunderkittens/
 
 .DS_STORE
+*build/

@@ -305,7 +305,7 @@ class ThunderKittensLowerer:
             source = self._val_name(op.source)
             dest = self._val_name(op.dest)
             coords = self._render_coords(op.coords)
-            return [f"{pad}warpgroup::store({source}, {dest}, {coords});"]
+            return [f"{pad}warpgroup::store({dest}, {source}, {coords});"]
 
         if isinstance(op, YieldOp):
             return []
