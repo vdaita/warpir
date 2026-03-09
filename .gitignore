@@ -7,3 +7,8 @@ __pycache__/
 outputs/
 
 *.egg-info/
+
+thunderkittens/
+
+.DS_STORE
+*build/
