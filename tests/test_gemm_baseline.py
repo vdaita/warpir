@@ -8,8 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from torch.utils.cpp_extension import load_inline
 
-from v2_tests.gemm_baseline_v2 import build_gemm_kernel
-from warpir_v2.lowering import ThunderKittensLowerer
+from tests.gemm_baseline_v2 import build_gemm_kernel
+from warpir.lowering import ThunderKittensLowerer
 
 WARPIR_ROOT = Path(__file__).resolve().parent.parent
 TK_INCLUDE = str(WARPIR_ROOT / "thunderkittens" / "include")
