@@ -51,6 +51,7 @@ EXTRA_CUDA_CFLAGS = [
     "--expt-extended-lambda", "--expt-relaxed-constexpr",
     "-DKITTENS_HOPPER",
     "-gencode", "arch=compute_90a,code=sm_90a",
+    "-I/usr/local/cuda/include",  # system CUDA headers must override torch-bundled ones
     f"-I{TK_INCLUDE}",
     "-DNDEBUG",
     "-D__CUDA_NO_HALF_OPERATORS__",
