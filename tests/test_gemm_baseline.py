@@ -19,6 +19,8 @@ NUM_THREADS = 128  # 1 warpgroup = 4 warps * 32 threads
 DYNAMIC_SMEM_BYTES = 100000  # generous upper bound, matches TK educational kernels
 
 LAUNCH_WRAPPER = f"""
+#include <torch/extension.h>
+
 void launch_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
     int N = A.size(0);
     using tile_gl = gl<bf16, 1, 1, -1, -1, st_bf<{BLOCK_SIZE}, {BLOCK_SIZE}>>;
@@ -62,14 +64,18 @@ def compile_kernel():
     kernel_ir = build_gemm_kernel()
     cuda_kernel = ThunderKittensLowerer().lower(kernel_ir)
 
-    cuda_src = (
-        '#include <torch/extension.h>\n'
-        + cuda_kernel
-        + LAUNCH_WRAPPER
-    )
+    # kittens.cuh MUST come before torch/extension.h to avoid bf16 type conflicts
+    cuda_src = cuda_kernel + LAUNCH_WRAPPER
 
-    build_dir = str(WARPIR_ROOT / "v2_tests" / "build")
+    # Dump for debugging
+    build_dir = str(WARPIR_ROOT / "tests" / "build")
     os.makedirs(build_dir, exist_ok=True)
+    debug_path = os.path.join(build_dir, "gemm_debug.cu")
+    with open(debug_path, "w") as f:
+        f.write(cuda_src)
+    print(f"Wrote debug CUDA to {debug_path}")
+    print(f"TK_INCLUDE: {TK_INCLUDE}")
+    print(f"TK_INCLUDE exists: {os.path.isdir(TK_INCLUDE)}")
 
     print("Compiling kernel...")
     return load_inline(
