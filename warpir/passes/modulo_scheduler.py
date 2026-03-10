@@ -3,7 +3,7 @@ from typing import List, Dict, Tuple, Union
 from ortools.sat.python import cp_model
 from rich import print
 
-from warpir.ir.ops import Kernel, ForOp, TMALoadOp, TMAStoreOp, MMAOp, Value, IterArg, YieldOp
+from warpir.ir.ops import Kernel, ForOp, TMALoadOp, TMAStoreOp, MMAOp, WaitOp, Value, IterArg, YieldOp, Op
 
 @dataclass
 class MSInstructionEdge:
@@ -215,95 +215,98 @@ def kernel_pass(kernel: Kernel) -> Kernel:
             new_body.append(op)
             continue
 
-        instr_to_op: Dict[str, object] = {str(b): b for b in op.body}
+        # ---- Build pipelined IR from scheduler results ----
+        #
+        # Structure:
+        #   prologue:  TMA loads for iteration 0
+        #   loop (i=1..N):  wait(cur) → load(i) → mma(cur) → yield(next, accum)
+        #   epilogue:  wait(last) → mma(last)
+        #
+        # The loop carries loaded tiles as iter_args so that each
+        # iteration computes on the *previous* iteration's loads while
+        # the current iteration's loads are in-flight.
 
-        # staged Values: num_stages fresh SSA values per result-producing op
-        staged: Dict[str, List[Value]] = {
-            inst_name: [
-                Value(f"{instr_to_op[inst_name].result.name}_s{s}", instr_to_op[inst_name].result.type)
-                for s in range(num_stages)
-            ]
-            for inst_name in stage_of
-            if hasattr(instr_to_op[inst_name], 'result')
-        }
+        load_ops = [b for b in op.body if isinstance(b, TMALoadOp)]
+        mma_ops = [b for b in op.body if isinstance(b, MMAOp)]
 
-        # Prologue: induction var → concrete iteration, result → staged[logical_iter] slot
-        for step in prologue:
-            for (logical_iter, inst_name) in step:
-                source_op = instr_to_op[inst_name]
-                subs = {op.induction_var: logical_iter}
-                if hasattr(source_op, 'result'):
-                    subs[source_op.result] = staged[inst_name][logical_iter]
-                new_body.append(source_op.substitute(subs))
+        # -- Prologue: issue TMA loads for iteration 0 --
+        pre_vals: Dict[Value, Value] = {}
+        for ld in load_ops:
+            pre = Value(f"{ld.result.name}_pre", ld.result.type)
+            pre_vals[ld.result] = pre
+            new_body.append(ld.substitute({op.induction_var: 0, ld.result: pre}))
 
-        # _cur iter_args: one per staged result, init from the last prologue-filled staged value
-        staged_iter_args = tuple(
-            IterArg(
-                block_arg=Value(f"{instr_to_op[inst_name].result.name}_cur", instr_to_op[inst_name].result.type),
-                init=staged[inst_name][num_stages - 1],
-            )
-            for inst_name in stage_of
-            if hasattr(instr_to_op[inst_name], 'result')
-        )
-        # inst_name → the _cur Value carried through the loop
-        staged_cur_vals: Dict[str, Value] = {
-            inst_name: staged_iter_args[i].block_arg
-            for i, inst_name in enumerate(n for n in stage_of if hasattr(instr_to_op[n], 'result'))
-        }
-        # original result → _cur Value, for remapping input operands inside the loop body
-        result_to_cur: Dict[Value, Value] = {
-            instr_to_op[inst_name].result: cur_val
-            for inst_name, cur_val in staged_cur_vals.items()
-        }
+        # -- Pipelined loop --
+        # New iter_args carry the prefetched tiles alongside the original accum
+        cur_vals: Dict[Value, Value] = {}
+        load_iter_args: List[IterArg] = []
+        for ld in load_ops:
+            cur = Value(f"{ld.result.name}_cur", ld.result.type)
+            cur_vals[ld.result] = cur
+            load_iter_args.append(IterArg(block_arg=cur, init=pre_vals[ld.result]))
 
-        # _final Values: what the ForOp yields for each staged buffer
-        staged_final_vals: Dict[str, Value] = {
-            inst_name: Value(f"{instr_to_op[inst_name].result.name}_final", instr_to_op[inst_name].result.type)
-            for inst_name in stage_of
-            if hasattr(instr_to_op[inst_name], 'result')
-        }
-        # original result → _final Value, for remapping epilogue operands
-        result_to_final: Dict[Value, Value] = {
-            instr_to_op[inst_name].result: final_val
-            for inst_name, final_val in staged_final_vals.items()
-        }
+        all_iter_args = tuple(load_iter_args) + op.iter_args
 
-        # Steady state body: remap all inputs via result_to_cur, keep induction var symbolic,
-        # remap result to _cur so the op writes into the right slot
-        steady_body = []
-        for (inst_name, stage_offset) in steady_state[0]:
-            source_op = instr_to_op[inst_name]
-            subs = {**result_to_cur, op.induction_var: op.induction_var}
-            if hasattr(source_op, 'result'):
-                subs[source_op.result] = staged_cur_vals[inst_name]
-            steady_body.append(source_op.substitute(subs))
+        # Body: wait for current → prefetch next → compute → yield
+        body_ops: List[Op] = []
 
-        steady_body.append(YieldOp(values=
-            tuple(staged_cur_vals[n] for n in stage_of if hasattr(instr_to_op[n], 'result'))
-            + tuple(result_to_cur.get(v, v) for v in yield_op.values)
+        body_ops.append(WaitOp(
+            values=tuple(cur_vals[ld.result] for ld in load_ops)
         ))
+
+        next_vals: Dict[Value, Value] = {}
+        for ld in load_ops:
+            nxt = Value(f"{ld.result.name}_next", ld.result.type)
+            next_vals[ld.result] = nxt
+            body_ops.append(ld.substitute({ld.result: nxt}))
+
+        cur_remap: Dict[Value, Union[Value, int]] = {
+            orig: cur_vals[orig] for orig in cur_vals
+        }
+        for mma_op in mma_ops:
+            body_ops.append(mma_op.substitute(cur_remap))
+
+        body_ops.append(YieldOp(
+            values=(
+                tuple(next_vals[ld.result] for ld in load_ops)
+                + yield_op.values
+            )
+        ))
+
+        # Results: final tile values + original loop results
+        final_vals: Dict[Value, Value] = {}
+        for ld in load_ops:
+            final = Value(f"{ld.result.name}_final", ld.result.type)
+            final_vals[ld.result] = final
+        all_results = tuple(final_vals[ld.result] for ld in load_ops) + op.results
 
         new_body.append(ForOp(
             induction_var=op.induction_var,
-            start=num_stages - 1,
+            start=1,
             stop=op.stop,
             step=op.step,
             tile_size=op.tile_size,
-            iter_args=staged_iter_args + op.iter_args,
-            body=tuple(steady_body),
-            results=tuple(staged_final_vals.values()) + op.results,
+            iter_args=all_iter_args,
+            body=tuple(body_ops),
+            results=all_results,
         ))
 
-        # Epilogue: remap staged results to _final, iter_args to their loop results
-        iter_arg_final: Dict[Value, Value] = {
-            ia.block_arg: op.results[i]
-            for i, ia in enumerate(op.iter_args)
-        }
-        for step in epilogue:
-            for (inst_name, buf_offset) in step:
-                source_op = instr_to_op[inst_name]
-                subs = {**result_to_final, **iter_arg_final, op.induction_var: buf_offset}
-                new_body.append(source_op.substitute(subs))
+        # -- Epilogue: process the last loaded tile --
+        new_body.append(WaitOp(
+            values=tuple(final_vals[ld.result] for ld in load_ops)
+        ))
+
+        epilogue_remap: Dict[Value, Union[Value, int]] = {}
+        for ld in load_ops:
+            epilogue_remap[ld.result] = final_vals[ld.result]
+        for i_ia, ia in enumerate(op.iter_args):
+            epilogue_remap[ia.block_arg] = op.results[i_ia]
+        for mma_op in mma_ops:
+            epilogue_result = Value(
+                f"{mma_op.result.name}_epilogue", mma_op.result.type
+            )
+            epilogue_remap[mma_op.result] = epilogue_result
+            new_body.append(mma_op.substitute(epilogue_remap))
 
     return Kernel(name=kernel.name, inputs=kernel.inputs, outputs=kernel.outputs, body=tuple(new_body))
 
