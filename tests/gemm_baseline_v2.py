@@ -47,8 +47,8 @@ def build_gemm_kernel() -> Kernel:
     N = Value("N", IntType())
 
     # Grid built-ins
-    row = Value("blockIdx.y", IntType())
-    col = Value("blockIdx.x", IntType())
+    row = Value("(int) blockIdx.y", IntType())
+    col = Value("(int) blockIdx.x", IntType())
 
     # SSA values
     c_init = Value("c_init", accum_reg)

@@ -147,7 +147,11 @@ class ThunderKittensLowerer:
     def _render_coord(self, c: Value | int) -> str:
         if isinstance(c, int):
             return str(c)
-        return self._val_name(c)
+        name = self._val_name(c)
+        if c.name in self.BUILTINS:
+            # todo: find better solution than hacky cast to int
+            return f"(int){name}"
+        return name
 
     def _render_coords(self, coords: tuple[Value | int, ...]) -> str:
         return "{" + ", ".join(self._render_coord(c) for c in coords) + "}"
