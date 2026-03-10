@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence, Union
+from typing import Sequence, Union, Dict
 
 from .types import TypeRef
 
@@ -18,7 +18,18 @@ class Value:
 
 class Op:
     """Base class for all IR operations."""
-    pass
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{k}={v}" for k, v in vars(self).items())
+        return f"{type(self).__name__}({fields})"
+        
+    def substitute(self, replacements: Dict[Value, Union[Value, int]]) -> 'Op':
+        def replace(v):
+            if isinstance(v, Value):
+                return replacements.get(v, v)
+            if isinstance(v, tuple):
+                return tuple(replace(x) for x in v)
+            return v
+        return type(self)(**{k: replace(v) for k, v in vars(self).items()})
 
 
 # ---------------------------------------------------------------------------

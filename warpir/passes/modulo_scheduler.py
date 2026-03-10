@@ -1,9 +1,9 @@
-from dataclasses import dataclass, field
-from pickletools import string1
-from typing import List, Dict, Tuple
-from math import ceil
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Union
 from ortools.sat.python import cp_model
 from rich import print
+
+from warpir.ir.ops import Kernel, ForOp, TMALoadOp, TMAStoreOp, MMAOp, Value, IterArg, YieldOp
 
 @dataclass
 class MSInstructionEdge:
@@ -118,6 +118,7 @@ class MSInstructionManager:
                 for instruction in self.instructions
             ) + 1
             
+            # prologue: list of steps, each step is list of (logical_iter, inst_name)
             prologue = []
             for i in range(num_stages - 1):
                 step = []
@@ -125,47 +126,186 @@ class MSInstructionManager:
                     if stage_of[instruction.name] <= i:
                         step.append((i - stage_of[instruction.name], instruction.name))
                 prologue.append(step)
-        
+
+            # steady state: grouped by k, each entry is list of (inst_name, buffer_offset)
             steady_state = []
             for k in range(num_stages - 1, depth):
+                step = []
                 for instruction in self.instructions:
-                    steady_state.append((instruction.name, k - stage_of[instruction.name]))
-            
+                    step.append((instruction.name, k - stage_of[instruction.name]))
+                steady_state.append(step)
+
+            # epilogue: list of drain steps, each is list of (inst_name, buffer_offset)
             epilogue = []
             for i in range(1, num_stages):
                 step = []
                 for instruction in self.instructions:
                     if stage_of[instruction.name] >= i:
-                        step.append((instruction.name, stage_of[instruction.name]))
+                        step.append((instruction.name, stage_of[instruction.name] - i))
                 epilogue.append(step)
-                
-            print("// Prologue")
-            for i, step in enumerate(prologue):
-                print(f"// iteration {i}")
-                for (logical_iter, inst_name) in step:
-                    inst = next(x for x in self.instructions if x.name == inst_name)
-                    print(f"  {inst_name}(buf\[{logical_iter}])   // stage {stage_of[inst_name]}, cycle {kernel_start[inst_name]}")
-                print()
-            
-            print(f"// Steady State - repeats every {ii_value} cycles")
-            print(f"for k in range({num_stages - 1}, N):")
-            for instruction in self.instructions:
-                offset = stage_of[instruction.name]
-                if offset == 0:
-                    print(f"    {instruction.name}(buf\[k])   // loads fresh data")
-                else:
-                    print(f"    {instruction.name}(buf\[k - {offset}])   // consuming data from {offset} iters ago")
-            print()
-            
-            print("// Epilogue")
-            for i, step in enumerate(epilogue):
-                print(f"// drain {i}")
-                for (inst_name, stage) in step:
-                    print(f"  {inst_name}(buf\[N - {stage - i}])")
-                print()
-                
+
+            return prologue, steady_state, epilogue, ii_value, num_stages, stage_of
+
         else:
-            print("No solution found.") 
+            print("No solution found.")
+            return None, None, None, None, None, None
+
+def kernel_pass(kernel: Kernel) -> Kernel:
+    resource_counts = {"tma": 4, "tc": 1}
+    max_cycles = 100
+    depth = 5
+    use_verbose = False
+
+    new_body = []
+    for op in kernel.body:
+        if not isinstance(op, ForOp) or op.step != 1:
+            new_body.append(op)
+            continue
+
+        manager = MSInstructionManager()
+        instructions: Dict[str, MSInstruction] = {}
+
+        for body_op in op.body:
+            instr = None
+            if type(body_op) == TMALoadOp:
+                instr = MSInstruction(resource="tma", latency=12, name=str(body_op), parent_edges=[])
+            elif type(body_op) == MMAOp:
+                instr = MSInstruction(resource="tc", latency=4, name=str(body_op), parent_edges=[])
+            elif type(body_op) == TMAStoreOp:
+                instr = MSInstruction(resource="tma", latency=12, name=str(body_op), parent_edges=[])
+            if instr:
+                instructions[str(body_op)] = instr
+
+        emitter_map: Dict[Value, MSInstruction] = {}
+        for body_op in op.body:
+            if type(body_op) in (TMALoadOp, MMAOp):
+                emitter_map[body_op.result] = instructions[str(body_op)]
+
+        yielded_values: set = {ia.block_arg for ia in op.iter_args}
+        yield_op = next(o for o in op.body if isinstance(o, YieldOp))
+        iter_arg_to_yield: Dict[Value, Value] = {
+            ia.block_arg: yield_op.values[i]
+            for i, ia in enumerate(op.iter_args)
+        }
+
+        for body_op in op.body:
+            if str(body_op) not in instructions:
+                continue
+            instr = instructions[str(body_op)]
+            input_fields = {k: v for k, v in vars(body_op).items() if k != 'result'}
+            for operand in (v for v in input_fields.values() if isinstance(v, Value)):
+                distance = 1 if operand in yielded_values else 0
+                source_val = iter_arg_to_yield.get(operand, operand)
+                if source_val in emitter_map:
+                    instr.parent_edges.append(MSInstructionEdge(
+                        source=emitter_map[source_val], dest=instr, distance=distance
+                    ))
+
+        for instr in instructions.values():
+            manager.add_instruction(instr)
+
+        prologue, steady_state, epilogue, ii_value, num_stages, stage_of = manager.solve(
+            max_cycles=max_cycles,
+            depth=depth,
+            resource_counts=resource_counts,
+            use_verbose=use_verbose,
+        )
+
+        if prologue is None:
+            new_body.append(op)
+            continue
+
+        instr_to_op: Dict[str, object] = {str(b): b for b in op.body}
+
+        # staged Values: num_stages fresh SSA values per result-producing op
+        staged: Dict[str, List[Value]] = {
+            inst_name: [
+                Value(f"{instr_to_op[inst_name].result.name}_s{s}", instr_to_op[inst_name].result.type)
+                for s in range(num_stages)
+            ]
+            for inst_name in stage_of
+            if hasattr(instr_to_op[inst_name], 'result')
+        }
+
+        # Prologue: induction var → concrete iteration, result → staged[logical_iter] slot
+        for step in prologue:
+            for (logical_iter, inst_name) in step:
+                source_op = instr_to_op[inst_name]
+                subs = {op.induction_var: logical_iter}
+                if hasattr(source_op, 'result'):
+                    subs[source_op.result] = staged[inst_name][logical_iter]
+                new_body.append(source_op.substitute(subs))
+
+        # _cur iter_args: one per staged result, init from the last prologue-filled staged value
+        staged_iter_args = tuple(
+            IterArg(
+                block_arg=Value(f"{instr_to_op[inst_name].result.name}_cur", instr_to_op[inst_name].result.type),
+                init=staged[inst_name][num_stages - 1],
+            )
+            for inst_name in stage_of
+            if hasattr(instr_to_op[inst_name], 'result')
+        )
+        # inst_name → the _cur Value carried through the loop
+        staged_cur_vals: Dict[str, Value] = {
+            inst_name: staged_iter_args[i].block_arg
+            for i, inst_name in enumerate(n for n in stage_of if hasattr(instr_to_op[n], 'result'))
+        }
+        # original result → _cur Value, for remapping input operands inside the loop body
+        result_to_cur: Dict[Value, Value] = {
+            instr_to_op[inst_name].result: cur_val
+            for inst_name, cur_val in staged_cur_vals.items()
+        }
+
+        # _final Values: what the ForOp yields for each staged buffer
+        staged_final_vals: Dict[str, Value] = {
+            inst_name: Value(f"{instr_to_op[inst_name].result.name}_final", instr_to_op[inst_name].result.type)
+            for inst_name in stage_of
+            if hasattr(instr_to_op[inst_name], 'result')
+        }
+        # original result → _final Value, for remapping epilogue operands
+        result_to_final: Dict[Value, Value] = {
+            instr_to_op[inst_name].result: final_val
+            for inst_name, final_val in staged_final_vals.items()
+        }
+
+        # Steady state body: remap all inputs via result_to_cur, keep induction var symbolic,
+        # remap result to _cur so the op writes into the right slot
+        steady_body = []
+        for (inst_name, stage_offset) in steady_state[0]:
+            source_op = instr_to_op[inst_name]
+            subs = {**result_to_cur, op.induction_var: op.induction_var}
+            if hasattr(source_op, 'result'):
+                subs[source_op.result] = staged_cur_vals[inst_name]
+            steady_body.append(source_op.substitute(subs))
+
+        steady_body.append(YieldOp(values=
+            tuple(staged_cur_vals[n] for n in stage_of if hasattr(instr_to_op[n], 'result'))
+            + tuple(result_to_cur.get(v, v) for v in yield_op.values)
+        ))
+
+        new_body.append(ForOp(
+            induction_var=op.induction_var,
+            start=num_stages - 1,
+            stop=op.stop,
+            step=op.step,
+            tile_size=op.tile_size,
+            iter_args=staged_iter_args + op.iter_args,
+            body=tuple(steady_body),
+            results=tuple(staged_final_vals.values()) + op.results,
+        ))
+
+        # Epilogue: remap staged results to _final, iter_args to their loop results
+        iter_arg_final: Dict[Value, Value] = {
+            ia.block_arg: op.results[i]
+            for i, ia in enumerate(op.iter_args)
+        }
+        for step in epilogue:
+            for (inst_name, buf_offset) in step:
+                source_op = instr_to_op[inst_name]
+                subs = {**result_to_final, **iter_arg_final, op.induction_var: buf_offset}
+                new_body.append(source_op.substitute(subs))
+
+    return Kernel(name=kernel.name, inputs=kernel.inputs, outputs=kernel.outputs, body=tuple(new_body))
 
 if __name__ == "__main__":
     manager = MSInstructionManager()

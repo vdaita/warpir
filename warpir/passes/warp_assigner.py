@@ -210,3 +210,5 @@ if __name__ == "__main__":
 
     print(f"II={II}  N={N}  instructions={len(all_instructions)}")
     manager.solve(max_cycles, num_warps, synchronization_cost, ["load_a", "load_b", "mac"], use_verbose)
+
+# TODO: convert instructions into WAInstructions
