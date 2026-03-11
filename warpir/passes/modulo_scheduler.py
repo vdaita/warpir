@@ -1,10 +1,11 @@
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Union
 from ortools.sat.python import cp_model
 from rich import print
 
 from warpir import *
-from warpir.lowering import lower_stmt as lower_stmt_impl, lower_program as lower_program_impl
+from warpir.lowering import lower_stmt, lower_program
 
 @dataclass
 class MSInstructionEdge:
@@ -160,20 +161,6 @@ class MSInstructionManager:
             print("No solution found.")
             return None, None, None, None, None, None
 
-def lower_for_stmt(for_stmt: ForStmt, prog: Program):
-    return ForStmt(
-        for_stmt.init,
-        for_stmt.cond,
-        for_stmt.step,
-        lower_stmt_impl(for_stmt.body),
-        for_stmt.inputs,
-        for_stmt.yields,
-    )
-
-
-def lower_program(program: Program):
-    return lower_program_impl(program)
-
 if __name__ == "__main__":
     manager = MSInstructionManager()
     max_cycles = 100
@@ -255,7 +242,7 @@ if __name__ == "__main__":
     print("Num stages: ", num_stages)
     print("Stage of: ", stage_of)
 
-    variable_buffer_sizes = {
+    variable_buffer_sizes: Dict[Var, int] = {
         a_tile.var: 1,
         b_tile.var: 1,
         c_tile.var: 1,
@@ -341,6 +328,126 @@ if __name__ == "__main__":
     lowered_sample_program = lower_program(sample_program)
     print("Sample IR (after lowering):")
     print(lowered_sample_program.kernel_stmt)
+
     
     # Algorithm to convert 
-        for 
+
+    # first generate all of the buffered variables (tiles and their lowered vars)
+    var_to_tile = {
+        a_tile.var: a_tile,
+        b_tile.var: b_tile,
+        c_tile.var: c_tile,
+    }
+
+    buffered_variables: Dict[Var, List[Var]] = {}
+    tile_buffer_map: Dict[Tile, List[Tile]] = {}
+    for var, size in variable_buffer_sizes.items():
+        tile = var_to_tile.get(var)
+        buffered_vars: List[Var] = []
+        for buf_id in range(size):
+            if tile is not None:
+                clone = Tile(
+                    f"{tile.name}_{buf_id}",
+                    tile.var_type,
+                    tile.use_semaphores,
+                    tile.num_consumers,
+                )
+                buffered_vars.append(clone)
+                tile_buffer_map.setdefault(tile, []).append(clone)
+            else:
+                clone_var = deepcopy(var)
+                clone_var.name = f"{var.name}_{buf_id}"
+                buffered_vars.append(clone_var)
+        buffered_variables[var] = buffered_vars
+
+    def buffer_index(offset: int, var: Var) -> int:
+        candidates = buffered_variables.get(var, [])
+        return offset % len(candidates) if candidates else 0
+
+    def instantiate_instruction(
+        inst_name: str,
+        iteration_expr: Expr,
+        buffer_offset: int
+    ) -> Stmt:
+        instruction = deepcopy(instruction_lookup[inst_name].instruction)
+        replacements: Dict[Var, Expr] = {tile_idx: iteration_expr}
+        output_var = instruction_lookup[inst_name].output_var
+        candidates = buffered_variables.get(output_var, [])
+        if candidates:
+            idx = buffer_index(buffer_offset, output_var)
+            replacements[output_var] = candidates[idx]
+            output_tile = var_to_tile.get(output_var)
+            if output_tile is not None and output_tile in tile_buffer_map:
+                clones = tile_buffer_map[output_tile]
+                replacements[output_tile] = clones[idx]
+                replacements[output_tile.var] = clones[idx]
+
+        for buffered_var, clones in buffered_variables.items():
+            if not clones or buffered_var in replacements:
+                continue
+            idx = buffer_index(buffer_offset, buffered_var)
+            replacements[buffered_var] = clones[idx]
+            tile = var_to_tile.get(buffered_var)
+            if tile is not None and tile in tile_buffer_map:
+                clones_for_tile = tile_buffer_map[tile]
+                replacements[tile] = clones_for_tile[idx]
+                replacements[tile.var] = clones_for_tile[idx]
+
+        return instruction.replace_vars(replacements)
+
+    prologue_stmts: List[Stmt] = []
+    for stage_idx, stage_entries in enumerate(prologue):
+        for iter_delta, inst_name in stage_entries:
+            iteration_value = max(stage_idx - iter_delta, 0)
+            iteration_expr = RawExpr(str(iteration_value))
+            prologue_stmts.append(
+                instantiate_instruction(inst_name, iteration_expr, iter_delta)
+            )
+
+    steady_stmts: List[Stmt] = []
+    for entries in steady_state:
+        for inst_name, buffer_offset in entries:
+            steady_stmts.append(
+                instantiate_instruction(inst_name, tile_idx, buffer_offset)
+            )
+
+    def make_epilogue_expr(drain_offset: int) -> Expr:
+        return BinaryOp(
+            BinaryOp(tile_limit, RawExpr(1), "-"),
+            RawExpr(drain_offset),
+            "-"
+        )
+
+    epilogue_stmts: List[Stmt] = []
+    for entries in epilogue:
+        for inst_name, drain_offset in entries:
+            epilogue_stmts.append(
+                instantiate_instruction(inst_name, make_epilogue_expr(drain_offset), drain_offset)
+            )
+
+    buffered_declarations: List[Stmt] = []
+    for clones in buffered_variables.values():
+        buffered_declarations.extend([clone.declare() for clone in clones])
+
+    steady_body = SeqStmt(steady_stmts)
+    pipelined_tile_loop = ForStmt(
+        AssignExpr(tile_idx, zero),
+        BinaryOp(tile_idx, tile_limit, "<"),
+        AssignExpr(tile_idx, BinaryOp(tile_idx, RawExpr(1), "+")),
+        steady_body,
+        inputs=[tile_idx],
+        yields=[buffered_variables[c_tile.var][0]],
+    )
+
+    pipelined_kernel_stmt = SeqStmt(
+        buffered_declarations
+        + [tile_idx.declare()]
+        + prologue_stmts
+        + [pipelined_tile_loop]
+        + epilogue_stmts
+    )
+
+    pipelined_program = Program(kernel_globals, pipelined_kernel_stmt)
+    print("Pipelined IR:")
+    print(pipelined_program.kernel_stmt)
+
