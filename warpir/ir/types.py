@@ -51,6 +51,16 @@ class GlobalType:
 
 
 @dataclass(frozen=True)
+class SharedBufferType:
+    """Mutable shared memory buffer array (not an SSA value)."""
+    tile_type: SharedTileType
+    count: int
+
+    def __str__(self) -> str:
+        return f"shared_buffer<{self.tile_type}, count={self.count}>"
+
+
+@dataclass(frozen=True)
 class ScalarType:
     name: str
 
@@ -63,4 +73,4 @@ class IntType(ScalarType):
         super().__init__("int")
 
 
-TypeRef = Union[GlobalType, IntType, SharedTileType, RegTileType]
+TypeRef = Union[GlobalType, IntType, SharedTileType, RegTileType, SharedBufferType]

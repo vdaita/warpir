@@ -1,9 +1,26 @@
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Union
 from ortools.sat.python import cp_model
-from rich import print
+# from rich import print
 
-from warpir.ir.ops import Kernel, ForOp, TMALoadOp, TMAStoreOp, MMAOp, WaitOp, Value, IterArg, YieldOp, Op
+from warpir.ir.ops import (
+    AllocSharedOp,
+    BufSlotExpr,
+    ForOp,
+    IterArg,
+    Kernel,
+    MMABufOp,
+    MMAOp,
+    Op,
+    TMALoadBufOp,
+    TMALoadOp,
+    TMAStoreOp,
+    Value,
+    WaitBufOp,
+    WaitOp,
+    YieldOp,
+)
+from warpir.ir.types import SharedBufferType
 
 @dataclass
 class MSInstructionEdge:
@@ -34,7 +51,6 @@ class MSInstructionManager:
     def solve(self, max_cycles: int, depth: int, resource_counts: Dict[str, int], use_verbose=False):
         model = cp_model.CpModel()
         
-        print("child edges: ", self.child_edges)
         
         for current_depth in range(depth):
             for instruction in self.instructions:
@@ -47,7 +63,7 @@ class MSInstructionManager:
                 )
                 self.intervals[(current_depth, instruction.name)] = instruction_interval
     
-        print("intervals: ", self.intervals)
+        # print("intervals: ", self.intervals)
             
         # parent-child relationships. 
         for current_depth in range(depth):
@@ -55,7 +71,7 @@ class MSInstructionManager:
                 for parent_edge in instruction.parent_edges:
                     if current_depth - parent_edge.distance >= 0:
                         model.add(self.intervals[(current_depth, instruction.name)].start_expr() >= self.intervals[(current_depth - parent_edge.distance, parent_edge.source.name)].end_expr()) # type: ignore
-                        print(f"{(current_depth - parent_edge.distance, parent_edge.source.name)} -> {(current_depth, instruction.name)}")
+                        # print(f"{(current_depth - parent_edge.distance, parent_edge.source.name)} -> {(current_depth, instruction.name)}")
                         
         # resource cumulative
         for resource in resource_counts.keys():
@@ -95,16 +111,15 @@ class MSInstructionManager:
                 for instruction in self.instructions:
                     start_time = solver.value(self.intervals[(current_depth, instruction.name)].start_expr()) # type: ignore
                     end_time = solver.value(self.intervals[(current_depth, instruction.name)].end_expr()) # type: ignore
-                    print("current depth: ", current_depth, " instruction name: ", instruction.name, start_time, end_time)
+                    # print("current depth: ", current_depth, " instruction name: ", instruction.name, start_time, end_time)
                     
                     time_assignments[start_time].append(f"start {current_depth}_{instruction.name}")
                     time_assignments[end_time].append(f"end {current_depth}_{instruction.name}")
 
-            for i in range(max_cycles):
-                print(f"cycle {i}: {time_assignments[i]}") 
+            # for i in range(max_cycles):
+                # print(f"cycle {i}: {time_assignments[i]}") 
                 
             ii_value = solver.value(ii)
-            print("II value: ", ii_value)
             kernel_start: Dict[str, int] = {
                 instruction.name: solver.value(self.intervals[(0, instruction.name)].start_expr()) # type: ignore
                 for instruction in self.instructions
@@ -147,7 +162,7 @@ class MSInstructionManager:
             return prologue, steady_state, epilogue, ii_value, num_stages, stage_of
 
         else:
-            print("No solution found.")
+            # print("No solution found.")
             return None, None, None, None, None, None
 
 def kernel_pass(kernel: Kernel) -> Kernel:
@@ -215,98 +230,130 @@ def kernel_pass(kernel: Kernel) -> Kernel:
             new_body.append(op)
             continue
 
-        # ---- Build pipelined IR from scheduler results ----
+        # ---- Build pipelined IR using buffer ops ----
         #
-        # Structure:
-        #   prologue:  TMA loads for iteration 0
-        #   loop (i=1..N):  wait(cur) → load(i) → mma(cur) → yield(next, accum)
-        #   epilogue:  wait(last) → mma(last)
-        #
-        # The loop carries loaded tiles as iter_args so that each
-        # iteration computes on the *previous* iteration's loads while
-        # the current iteration's loads are in-flight.
+        # Shared memory is modelled as mutable buffer arrays, not SSA
+        # values.  The ForOp only carries the accumulator as an iter_arg;
+        # buffer indexing is expressed via BufSlotExpr.
 
+        pipeline_depth = num_stages - 1
+        instr_to_op: Dict[str, Op] = {str(b): b for b in op.body}
         load_ops = [b for b in op.body if isinstance(b, TMALoadOp)]
         mma_ops = [b for b in op.body if isinstance(b, MMAOp)]
 
-        # -- Prologue: issue TMA loads for iteration 0 --
-        pre_vals: Dict[Value, Value] = {}
+        # ---- ALLOC SHARED BUFFERS ----
+        buf_values: Dict[Value, Value] = {}
         for ld in load_ops:
-            pre = Value(f"{ld.result.name}_pre", ld.result.type)
-            pre_vals[ld.result] = pre
-            new_body.append(ld.substitute({op.induction_var: 0, ld.result: pre}))
+            buf_type = SharedBufferType(
+                tile_type=ld.result.type,
+                count=num_stages,
+            )
+            buf_val = Value(f"{ld.source.name.lower()}_bufs", buf_type)
+            buf_values[ld.result] = buf_val
+            new_body.append(AllocSharedOp(result=buf_val))
 
-        # -- Pipelined loop --
-        # New iter_args carry the prefetched tiles alongside the original accum
-        cur_vals: Dict[Value, Value] = {}
-        load_iter_args: List[IterArg] = []
-        for ld in load_ops:
-            cur = Value(f"{ld.result.name}_cur", ld.result.type)
-            cur_vals[ld.result] = cur
-            load_iter_args.append(IterArg(block_arg=cur, init=pre_vals[ld.result]))
+        # ---- PROLOGUE: fill pipeline with pipeline_depth load steps ----
+        for step_idx, step_ops in enumerate(prologue):
+            for (logical_iter, inst_name) in step_ops:
+                source_op = instr_to_op[inst_name]
+                if not isinstance(source_op, TMALoadOp):
+                    continue
+                coords_op = source_op.substitute(
+                    {op.induction_var: logical_iter}
+                )
+                new_body.append(TMALoadBufOp(
+                    buf=buf_values[source_op.result],
+                    slot=step_idx,
+                    source=source_op.source,
+                    coords=coords_op.coords,
+                ))
 
-        all_iter_args = tuple(load_iter_args) + op.iter_args
+        # ---- STEADY STATE LOOP ----
+        # Use steady_state[0] to determine loop body ops and ordering.
+        # All steady-state steps have the same instructions (just on
+        # different logical iterations), so step 0 is representative.
 
-        # Body: wait for current → prefetch next → compute → yield
+        mma_stage = stage_of[str(mma_ops[0])]
+        compute_slot = BufSlotExpr(
+            value=op.induction_var,
+            offset=-mma_stage,
+            modulus=num_stages,
+        )
+
         body_ops: List[Op] = []
 
-        body_ops.append(WaitOp(
-            values=tuple(cur_vals[ld.result] for ld in load_ops)
+        body_ops.append(WaitBufOp(
+            bufs=tuple(buf_values[ld.result] for ld in load_ops),
+            slot=compute_slot,
         ))
 
-        next_vals: Dict[Value, Value] = {}
-        for ld in load_ops:
-            nxt = Value(f"{ld.result.name}_next", ld.result.type)
-            next_vals[ld.result] = nxt
-            body_ops.append(ld.substitute({ld.result: nxt}))
-
-        cur_remap: Dict[Value, Union[Value, int]] = {
-            orig: cur_vals[orig] for orig in cur_vals
-        }
-        for mma_op in mma_ops:
-            body_ops.append(mma_op.substitute(cur_remap))
-
-        body_ops.append(YieldOp(
-            values=(
-                tuple(next_vals[ld.result] for ld in load_ops)
-                + yield_op.values
+        for (inst_name, _buf_offset) in steady_state[0]:
+            source_op = instr_to_op[inst_name]
+            op_stage = stage_of[inst_name]
+            slot = BufSlotExpr(
+                value=op.induction_var,
+                offset=-op_stage,
+                modulus=num_stages,
             )
-        ))
 
-        # Results: final tile values + original loop results
-        final_vals: Dict[Value, Value] = {}
-        for ld in load_ops:
-            final = Value(f"{ld.result.name}_final", ld.result.type)
-            final_vals[ld.result] = final
-        all_results = tuple(final_vals[ld.result] for ld in load_ops) + op.results
+            if isinstance(source_op, TMALoadOp):
+                body_ops.append(TMALoadBufOp(
+                    buf=buf_values[source_op.result],
+                    slot=slot,
+                    source=source_op.source,
+                    coords=source_op.coords,
+                ))
+            elif isinstance(source_op, MMAOp):
+                body_ops.append(MMABufOp(
+                    result=source_op.result,
+                    a_buf=buf_values[source_op.a],
+                    a_slot=slot,
+                    b_buf=buf_values[source_op.b],
+                    b_slot=slot,
+                    accum=source_op.accum,
+                ))
+
+        body_ops.append(yield_op)
 
         new_body.append(ForOp(
             induction_var=op.induction_var,
-            start=1,
+            start=pipeline_depth,
             stop=op.stop,
             step=op.step,
             tile_size=op.tile_size,
-            iter_args=all_iter_args,
+            iter_args=op.iter_args,
             body=tuple(body_ops),
-            results=all_results,
+            results=op.results,
         ))
 
-        # -- Epilogue: process the last loaded tile --
-        new_body.append(WaitOp(
-            values=tuple(final_vals[ld.result] for ld in load_ops)
-        ))
-
-        epilogue_remap: Dict[Value, Union[Value, int]] = {}
-        for ld in load_ops:
-            epilogue_remap[ld.result] = final_vals[ld.result]
-        for i_ia, ia in enumerate(op.iter_args):
-            epilogue_remap[ia.block_arg] = op.results[i_ia]
-        for mma_op in mma_ops:
-            epilogue_result = Value(
-                f"{mma_op.result.name}_epilogue", mma_op.result.type
+        # ---- EPILOGUE: drain remaining pipeline_depth compute steps ----
+        for ep_step, ep_ops in enumerate(epilogue):
+            buf_list = tuple(buf_values[ld.result] for ld in load_ops)
+            drain_slot = BufSlotExpr(
+                value=None, offset=ep_step, modulus=num_stages,
             )
-            epilogue_remap[mma_op.result] = epilogue_result
-            new_body.append(mma_op.substitute(epilogue_remap))
+            new_body.append(WaitBufOp(bufs=buf_list, slot=drain_slot))
+            for (inst_name, _buf_offset) in ep_ops:
+                source_op = instr_to_op[inst_name]
+                if isinstance(source_op, MMAOp):
+                    ep_result = Value(
+                        f"{source_op.result.name}_ep{ep_step}",
+                        source_op.result.type,
+                    )
+                    accum_result = op.results[
+                        next(
+                            j for j, ia in enumerate(op.iter_args)
+                            if ia.block_arg == source_op.accum
+                        )
+                    ]
+                    new_body.append(MMABufOp(
+                        result=ep_result,
+                        a_buf=buf_values[source_op.a],
+                        a_slot=drain_slot,
+                        b_buf=buf_values[source_op.b],
+                        b_slot=drain_slot,
+                        accum=accum_result,
+                    ))
 
     return Kernel(name=kernel.name, inputs=kernel.inputs, outputs=kernel.outputs, body=tuple(new_body))
 

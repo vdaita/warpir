@@ -119,8 +119,9 @@ if __name__ == "__main__":
     out_path = Path(__file__).parent / "outputs" / "gemm_baseline.cu"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(cuda_src)
+    print(f"Wrote {out_path}")
     
     out_path_pipelined = Path(__file__).parent / "outputs" / "gemm_baseline_pipelined.cu"
-    out_path.write_text(cuda_src_pipelined)
+    out_path_pipelined.write_text(cuda_src_pipelined)
     
-    print(f"Wrote {out_path}")
+    print(f"Wrote {out_path_pipelined}")

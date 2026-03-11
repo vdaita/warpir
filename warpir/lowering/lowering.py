@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from warpir.ir.ops import (
+    AllocSharedOp,
+    BufSlotExpr,
     ForOp,
     Kernel,
+    MMABufOp,
     MMAOp,
     Op,
+    TMALoadBufOp,
     TMALoadOp,
     TMAStoreOp,
     Value,
+    WaitBufOp,
     WaitOp,
     YieldOp,
     ZeroOp,
@@ -17,6 +22,7 @@ from warpir.ir.types import (
     GlobalType,
     IntType,
     RegTileType,
+    SharedBufferType,
     SharedTileType,
     TileLayout,
     TypeRef,
@@ -39,6 +45,8 @@ class ThunderKittensLowerer:
         self._sem_counter = 0
         self._wait_group_sems: dict[frozenset[str], str] = {}
         self._load_to_sem: dict[str, str] = {}
+        self._buf_allocations: dict[str, SharedBufferType] = {}
+        self._buf_num_stages: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -52,6 +60,7 @@ class ThunderKittensLowerer:
 
         self._build_aliases(kernel.body)
         self._analyze_semaphores(kernel.body)
+        self._analyze_buffer_ops(kernel.body)
 
         decls = self._collect_declarations(kernel)
         sem_decls = self._emit_sem_decls()
@@ -92,7 +101,7 @@ class ThunderKittensLowerer:
         return resolved
 
     # ------------------------------------------------------------------
-    # Semaphore analysis
+    # Semaphore analysis (SSA WaitOp path)
     # ------------------------------------------------------------------
 
     def _analyze_semaphores(self, ops: tuple[Op, ...]) -> None:
@@ -108,6 +117,21 @@ class ThunderKittensLowerer:
                     self._load_to_sem[self._resolve(v.name)] = sem
             elif isinstance(op, ForOp):
                 self._analyze_semaphores(op.body)
+
+    # ------------------------------------------------------------------
+    # Buffer op analysis
+    # ------------------------------------------------------------------
+
+    def _analyze_buffer_ops(self, ops: tuple[Op, ...]) -> None:
+        for op in ops:
+            if isinstance(op, AllocSharedOp):
+                self._buf_allocations[op.result.name] = op.result.type
+                if isinstance(op.result.type, SharedBufferType):
+                    self._buf_num_stages = max(
+                        self._buf_num_stages, op.result.type.count,
+                    )
+            elif isinstance(op, ForOp):
+                self._analyze_buffer_ops(op.body)
 
     # ------------------------------------------------------------------
     # ThunderKittens type rendering
@@ -139,16 +163,32 @@ class ThunderKittensLowerer:
         raise TypeError(f"Cannot render type to TK: {t}")
 
     # ------------------------------------------------------------------
-    # Coordinate rendering
+    # Coordinate / buffer-index rendering
     # ------------------------------------------------------------------
 
     def _render_coord(self, c: Value | int) -> str:
         if isinstance(c, int):
             return str(c)
-        return self._val_name(c)
+        name = self._val_name(c)
+        if name in ("blockIdx.x", "blockIdx.y", "blockIdx.z"):
+            return f"(int){name}"
+        return name
 
     def _render_coords(self, coords: tuple[Value | int, ...]) -> str:
         return "{" + ", ".join(self._render_coord(c) for c in coords) + "}"
+
+    def _render_buf_idx(self, slot, buf_name: str) -> str:
+        if isinstance(slot, int):
+            return str(slot)
+        # BufSlotExpr
+        mod = slot.modulus
+        if slot.value is None:
+            return "_compute_buf"
+        val = self._val_name(slot.value)
+        eff_offset = slot.offset % mod
+        if eff_offset == 0:
+            return f"{val} % {mod}"
+        return f"({val} + {eff_offset}) % {mod}"
 
     # ------------------------------------------------------------------
     # Variable declarations
@@ -157,6 +197,17 @@ class ThunderKittensLowerer:
     def _collect_declarations(self, kernel: Kernel) -> list[str]:
         decls: list[str] = []
         declared: set[str] = set()
+
+        # Buffer array declarations via dynamic shared allocator
+        if self._buf_allocations:
+            decls.append("extern __shared__ alignment_dummy __shm[];")
+            decls.append("shared_allocator al((int*)&__shm[0]);")
+            for name, bt in self._buf_allocations.items():
+                ts = self._render_tk_type(bt.tile_type)
+                decls.append(
+                    f"{ts} (&{name})[{bt.count}] = "
+                    f"al.allocate<{ts}, {bt.count}>();"
+                )
 
         def try_decl(name: str, typ: TypeRef, shared: bool = False) -> None:
             resolved = self._resolve(name)
@@ -175,8 +226,14 @@ class ThunderKittensLowerer:
                 elif isinstance(op, ForOp):
                     try_decl(op.induction_var.name, op.induction_var.type)
                     walk(op.body)
+                elif isinstance(op, (AllocSharedOp, TMALoadBufOp)):
+                    pass
 
         walk(kernel.body)
+
+        if self._buf_allocations:
+            decls.append("int _compute_buf = 0;")
+
         return decls
 
     def _emit_sem_decls(self) -> list[str]:
@@ -187,6 +244,15 @@ class ThunderKittensLowerer:
             lines.append(f"int {tic} = 0;")
             lines.append(f"if (threadIdx.x == 0) {{")
             lines.append(f"  init_semaphore({sem}, 0, 1);")
+            lines.append(f"}}")
+        n = self._buf_num_stages
+        if n:
+            tic_init = ", ".join(["0"] * n)
+            lines.append(f"__shared__ semaphore sem_pipe[{n}];")
+            lines.append(f"int tic[{n}] = {{{tic_init}}};")
+            lines.append(f"if (threadIdx.x == 0) {{")
+            lines.append(f"  for (int _s = 0; _s < {n}; _s++) "
+                         f"init_semaphore(sem_pipe[_s], 0, 1);")
             lines.append(f"}}")
         if lines:
             lines.append("__syncthreads();")
@@ -241,10 +307,20 @@ class ThunderKittensLowerer:
                     batch.append(ops[i])  # type: ignore[arg-type]
                     i += 1
                 lines.extend(self._lower_tma_batch(batch, depth))
+            elif isinstance(ops[i], TMALoadBufOp):
+                batch_buf: list[TMALoadBufOp] = []
+                while i < len(ops) and isinstance(ops[i], TMALoadBufOp):
+                    batch_buf.append(ops[i])  # type: ignore[arg-type]
+                    i += 1
+                lines.extend(self._lower_tma_buf_batch(batch_buf, depth))
             else:
                 lines.extend(self._lower_op(ops[i], depth))
                 i += 1
         return lines
+
+    # ------------------------------------------------------------------
+    # SSA TMA load batching (non-pipelined path)
+    # ------------------------------------------------------------------
 
     def _lower_tma_batch(self, loads: list[TMALoadOp], depth: int) -> list[str]:
         pad = "  " * depth
@@ -263,7 +339,7 @@ class ThunderKittensLowerer:
             ]
             expect_expr = " + ".join(expect_parts)
 
-            lines.append(f"{pad}if (warpgroup::laneid() == 0) {{")
+            lines.append(f"{pad}if (threadIdx.x == 0) {{")
             lines.append(f"{pad1}tma::expect_bytes({sem}, {expect_expr});")
             for ld in group_loads:
                 result = self._val_name(ld.result)
@@ -275,8 +351,66 @@ class ThunderKittensLowerer:
             lines.append(f"{pad}}}")
         return lines
 
+    # ------------------------------------------------------------------
+    # Buffer TMA load batching (pipelined path)
+    # ------------------------------------------------------------------
+
+    def _lower_tma_buf_batch(
+        self, loads: list[TMALoadBufOp], depth: int
+    ) -> list[str]:
+        pad = "  " * depth
+        pad1 = "  " * (depth + 1)
+
+        def _slot_key(slot):
+            if isinstance(slot, int):
+                return ("lit", slot)
+            return ("expr", slot.value.name if slot.value else None,
+                    slot.offset, slot.modulus)
+
+        groups: list[list[TMALoadBufOp]] = []
+        cur: list[TMALoadBufOp] = [loads[0]]
+        for ld in loads[1:]:
+            if _slot_key(ld.slot) == _slot_key(cur[0].slot):
+                cur.append(ld)
+            else:
+                groups.append(cur)
+                cur = [ld]
+        groups.append(cur)
+
+        lines: list[str] = []
+        lines.append(f"{pad}if (threadIdx.x == 0) {{")
+        for group in groups:
+            slot_idx = self._render_buf_idx(group[0].slot, group[0].buf.name)
+            sem_expr = f"sem_pipe[{slot_idx}]"
+
+            expect_parts = [
+                f"size_bytes<typeof({ld.buf.name}[0])>"
+                for ld in group
+            ]
+            expect_expr = " + ".join(expect_parts)
+            lines.append(f"{pad1}tma::expect_bytes({sem_expr}, {expect_expr});")
+            for ld in group:
+                idx = self._render_buf_idx(ld.slot, ld.buf.name)
+                source = self._val_name(ld.source)
+                coords = self._render_coords(ld.coords)
+                lines.append(
+                    f"{pad1}tma::load_async("
+                    f"{ld.buf.name}[{idx}], {source}, {coords}, {sem_expr});"
+                )
+        lines.append(f"{pad}}}")
+        if depth == 1:
+            lines.append(f"{pad}__syncthreads();")
+        return lines
+
+    # ------------------------------------------------------------------
+    # Single-op lowering
+    # ------------------------------------------------------------------
+
     def _lower_op(self, op: Op, depth: int) -> list[str]:
         pad = "  " * depth
+
+        if isinstance(op, AllocSharedOp):
+            return []
 
         if isinstance(op, ZeroOp):
             return [f"{pad}kittens::warp::zero({self._val_name(op.result)});"]
@@ -291,6 +425,14 @@ class ThunderKittensLowerer:
                 f"{pad}__syncthreads();",
             ]
 
+        if isinstance(op, WaitBufOp):
+            slot_idx = self._render_buf_idx(op.slot, "")
+            return [
+                f"{pad}wait(sem_pipe[{slot_idx}], tic[{slot_idx}]);",
+                f"{pad}tic[{slot_idx}] ^= 1;",
+                f"{pad}__syncthreads();",
+            ]
+
         if isinstance(op, MMAOp):
             accum = self._val_name(op.accum)
             a = self._val_name(op.a)
@@ -300,6 +442,24 @@ class ThunderKittensLowerer:
                 f"{pad}warpgroup::mma_async_wait();",
                 f"{pad}__syncthreads();",
             ]
+
+        if isinstance(op, MMABufOp):
+            accum = self._val_name(op.accum)
+            a_idx = self._render_buf_idx(op.a_slot, op.a_buf.name)
+            b_idx = self._render_buf_idx(op.b_slot, op.b_buf.name)
+            lines = [
+                f"{pad}warpgroup::mma_AB({accum}, "
+                f"{op.a_buf.name}[{a_idx}], {op.b_buf.name}[{b_idx}]);",
+                f"{pad}warpgroup::mma_async_wait();",
+                f"{pad}__syncthreads();",
+            ]
+            # Advance drain counter after each MMA
+            mod = op.a_slot.modulus if isinstance(op.a_slot, BufSlotExpr) else 0
+            if mod:
+                lines.append(
+                    f"{pad}_compute_buf = (_compute_buf + 1) % {mod};"
+                )
+            return lines
 
         if isinstance(op, TMAStoreOp):
             source = self._val_name(op.source)
