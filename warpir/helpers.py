@@ -20,9 +20,11 @@ class Tile(Var):
         return str(self.var)
 
     def __eq__(self, other):
-        if not isinstance(other, Tile):
-            return False
-        return (self.var, self.use_semaphores, self.num_consumers) == (other.var, other.use_semaphores, other.num_consumers)
+        if isinstance(other, Tile):
+            return (self.var, self.use_semaphores, self.num_consumers) == (other.var, other.use_semaphores, other.num_consumers)
+        if isinstance(other, Var):
+            return self.var == other
+        return False
 
     def __hash__(self):
         return hash(str(self))

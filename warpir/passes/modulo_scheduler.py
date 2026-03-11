@@ -14,7 +14,7 @@ class MSInstructionEdge:
     distance: int
 
 def stringify_dict(in_dict):
-    return {str(k): str(v) for k, v in variable_replacements.items()}
+    return {str(k): str(v) for k, v in in_dict.items()}
 
 @dataclass
 class MSInstruction:
@@ -304,21 +304,31 @@ if __name__ == "__main__":
     for var, size in variable_buffer_sizes.items():
         buffered_variables[var] = []
         for buf_id in range(size):
-            clone_var = deepcopy(var)
-            clone_var.name = f"{var.name}_{buf_id}"
-            buffered_variables[var].append(clone_var)
+            template = None
+            for tile_candidate in [a_tile, b_tile, c_tile]:
+                if tile_candidate == var or tile_candidate.var == var:
+                    template = tile_candidate
+                    break
+            if template is None:
+                template = var
+
+            clone = deepcopy(template)
+            clone.name = f"{template.name}_{buf_id}"
+            if isinstance(clone, Tile):
+                clone.var.name = clone.name
+            buffered_variables[var].append(clone)
 
     prologue_stmts: List[Stmt] = []
     for stage_idx, stage_entries in enumerate(prologue):
         for iter_delta, instruction in stage_entries:
             # all of the input variables that go into this are handled b
             variable_replacements: Dict[Var, Expr] = {
-                # tile_idx: BinaryOp(tile_idx, RawExpr(iter_delta), "+"),
-                tile_idx: RawExpr(stage_idx) # right?
+                tile_idx: RawExpr(stage_idx)
             }
             for var in buffered_variables:
-                variable_replacements[var] = buffered_variables[var][iter_delta % variable_buffer_sizes[var]]
-        
+                idx = iter_delta % variable_buffer_sizes[var]
+                variable_replacements[var] = buffered_variables[var][idx]
+       
             print("In prologue instruction ", instruction.instruction, " with stage ", stage_idx, " and iter_delta ", iter_delta, " using following map: ", stringify_dict(variable_replacements))
 
             prologue_stmts.append(
@@ -334,7 +344,8 @@ if __name__ == "__main__":
                 tile_idx: BinaryOp(tile_idx, RawExpr(iter_delta), "+")
             }
             for var in buffered_variables:
-                variable_replacements[var] = buffered_variables[var][iter_delta % variable_buffer_sizes[var]]
+                idx = iter_delta % variable_buffer_sizes[var]
+                variable_replacements[var] = buffered_variables[var][idx]
             if_wrapper = IfStmt(BinaryOp(BinaryOp(tile_idx, RawExpr(iter_delta), "+"), N, "<"), instruction.instruction.replace_vars(variable_replacements))
             print("In steady state instruction ", instruction.instruction, " with stage ", stage_idx, " and iter_delta ", iter_delta, " using following map: ", stringify_dict(variable_replacements))
             steady_state_stmts.append(if_wrapper)
@@ -348,7 +359,8 @@ if __name__ == "__main__":
                 tile_idx: BinaryOp(tile_idx, RawExpr(iter_delta), "-")
             }
             for var in buffered_variables:
-                variable_replacements[var] = buffered_variables[var][iter_delta % variable_buffer_sizes[var]]
+                idx = iter_delta % variable_buffer_sizes[var]
+                variable_replacements[var] = buffered_variables[var][idx]
             print("In epilogue instruction ", instruction.instruction, " with stage ", stage_idx, " and iter_delta ", iter_delta, " using following map: ", stringify_dict(variable_replacements))
             epilogue_stmts.append(instruction.instruction.replace_vars(variable_replacements))
     
@@ -385,3 +397,6 @@ if __name__ == "__main__":
     print("Pipelined IR:")
     print(pipelined_program.kernel_stmt)
 
+    lowered_pipelined_program = lower_program(pipelined_program)
+    print("Pipelined program: ")
+    print(lowered_pipelined_program.kernel_stmt)
