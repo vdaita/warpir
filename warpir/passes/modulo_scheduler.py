@@ -188,11 +188,31 @@ def _vars_in_expr(expr: Expr) -> List[Var]:
     return []
 
 
+def _input_vars_for_opcall(call: OpCall) -> List[Var]:
+    # Op calls with explicit destination operands should not treat those
+    # destination operands as read dependencies.
+    excluded_positions: Dict[str, Set[int]] = {
+        "tma::load_async": {0},
+        "warpgroup::zero": {0},
+        "kittens::warp::zero": {0},
+    }
+    excluded = excluded_positions.get(call.function_name, set())
+
+    vars_found: List[Var] = []
+    for idx, inp in enumerate(call.inputs):
+        if idx in excluded:
+            continue
+        vars_found.extend(_vars_in_expr(inp))
+    return vars_found
+
+
 def _vars_in_stmt(stmt: Stmt) -> List[Var]:
     if isinstance(stmt, TileLoadOp):
         # TileLoadOp writes to tile; only source/coords are true read dependencies.
         return [stmt.source] + _vars_in_expr(stmt.coord)
     if isinstance(stmt, ExprStmt):
+        if isinstance(stmt.call, OpCall):
+            return _input_vars_for_opcall(stmt.call)
         return _vars_in_expr(stmt.call)
     if isinstance(stmt, SeqStmt):
         vars_found: List[Var] = []
@@ -230,13 +250,35 @@ def _op_calls_in_stmt(stmt: Stmt) -> List[OpCall]:
     return []
 
 
+def _stmt_has_call(stmt: Stmt, function_name: str) -> bool:
+    return any(call.function_name == function_name for call in _op_calls_in_stmt(stmt))
+
+
+def _is_full_wait_stmt(stmt: Stmt) -> bool:
+    for call in _op_calls_in_stmt(stmt):
+        if call.function_name != "wait" or not call.inputs:
+            continue
+        sem = call.inputs[0]
+        if isinstance(sem, Var) and sem.name.startswith("full_"):
+            return True
+    return False
+
+
 def _side_effect_outputs(stmt: Stmt) -> List[Var]:
     if isinstance(stmt, TileLoadOp):
         return [stmt.output] if stmt.output is not None else []
 
     outputs: List[Var] = []
     for call in _op_calls_in_stmt(stmt):
-        if call.function_name in {"warpgroup::mma_AB", "warpgroup::zero"} and call.inputs:
+        if call.function_name in {"warpgroup::mma_AB", "warpgroup::zero", "kittens::warp::zero"} and call.inputs:
+            first_arg = call.inputs[0]
+            if isinstance(first_arg, Var):
+                outputs.append(first_arg)
+        elif call.function_name == "tma::load_async" and call.inputs:
+            first_arg = call.inputs[0]
+            if isinstance(first_arg, Var):
+                outputs.append(first_arg)
+        elif call.function_name == "arrive" and call.inputs:
             first_arg = call.inputs[0]
             if isinstance(first_arg, Var):
                 outputs.append(first_arg)
@@ -248,6 +290,12 @@ def _instruction_signature(stmt: Stmt) -> Optional[Tuple[Union[str, Tuple[str, .
         return ("tma", 12)
 
     call_names = {call.function_name for call in _op_calls_in_stmt(stmt)}
+    if "tma::load_async" in call_names:
+        return ("tma", 12)
+    if "wait" in call_names:
+        return ("barrier", 1)
+    if "arrive" in call_names:
+        return ("barrier", 1)
     if "warpgroup::mma_AB" in call_names:
         return ("tc", 4)
 
@@ -304,6 +352,8 @@ def build_instruction_manager(loop_stmt: ForStmt) -> MSInstructionManager:
                 continue
 
             distance = 1 if input_var in yield_vars else 0
+            if parent is instruction and distance == 0:
+                continue
             edge = MSInstructionEdge(source=parent, dest=instruction, distance=distance)
             instruction.parent_edges.append(edge)
             manager.child_edges[parent.name] = manager.child_edges.get(parent.name, []) + [edge]
@@ -350,13 +400,21 @@ def _replace_tile_idx(base_idx: Var, iter_delta: int, mode: str) -> Expr:
     if mode == "steady":
         return BinaryOp(base_idx, RawExpr(iter_delta), "+")
     if mode == "epilogue":
-        return BinaryOp(base_idx, RawExpr(iter_delta), "-")
+        # Drain operates on iterations immediately before loop-exit base.
+        return BinaryOp(base_idx, RawExpr(iter_delta + 1), "-")
     raise ValueError(f"unknown replacement mode: {mode}")
 
 
-def _iter_guard(loop_stmt: ForStmt, tile_idx: Var, iter_delta: int) -> Expr:
-    idx_expr = BinaryOp(tile_idx, RawExpr(iter_delta), "+")
+def _iter_guard(loop_stmt: ForStmt, tile_idx: Var, idx_expr: Expr) -> Expr:
     return loop_stmt.cond.replace_vars({tile_idx: idx_expr})
+
+
+def _logical_iter_offset(iter_delta: int, mode: str) -> int:
+    if mode in {"prologue", "steady"}:
+        return iter_delta
+    if mode == "epilogue":
+        return -iter_delta - 1
+    raise ValueError(f"unknown replacement mode: {mode}")
 
 
 def _build_schedule_stmts(
@@ -369,16 +427,49 @@ def _build_schedule_stmts(
     output_stmts: List[Stmt] = []
     for stage_entries in schedule_steps:
         for iter_delta, instruction in stage_entries:
-            variable_replacements: Dict[Var, Expr] = {tile_idx: _replace_tile_idx(tile_idx, iter_delta, mode)}
+            replaced_tile_idx = _replace_tile_idx(tile_idx, iter_delta, mode)
+            logical_offset = _logical_iter_offset(iter_delta, mode)
+
+            variable_replacements: Dict[Var, Expr] = {tile_idx: replaced_tile_idx}
             for var, buffers in buffered_variables.items():
-                idx = iter_delta % len(buffers)
+                idx = logical_offset % len(buffers)
                 variable_replacements[var] = buffers[idx]
 
             replaced_stmt = instruction.instruction.replace_vars(variable_replacements)
-            if mode == "steady":
-                replaced_stmt = IfStmt(_iter_guard(loop_stmt, tile_idx, iter_delta), replaced_stmt)
+            if mode in {"steady", "epilogue"}:
+                replaced_stmt = IfStmt(_iter_guard(loop_stmt, tile_idx, replaced_tile_idx), replaced_stmt)
             output_stmts.append(replaced_stmt)
     return output_stmts
+
+
+def _build_drain_epilogue_stmts(
+    manager: MSInstructionManager,
+    tile_idx: Var,
+    buffered_variables: Dict[Var, List[Var]],
+    loop_stmt: ForStmt,
+    num_stages: int,
+) -> List[Stmt]:
+    # Drain in reverse buffer order: slot N-1, ..., 0.
+    wait_instructions = [
+        instruction for instruction in manager.instructions if _is_full_wait_stmt(instruction.instruction)
+    ]
+    compute_instructions = [
+        instruction for instruction in manager.instructions if _stmt_has_call(instruction.instruction, "warpgroup::mma_AB")
+    ]
+    drain_instructions = wait_instructions + compute_instructions
+
+    epilogue_stmts: List[Stmt] = []
+    for slot in range(num_stages - 1, -1, -1):
+        iter_expr = BinaryOp(tile_idx, RawExpr(num_stages - slot), "-")
+        variable_replacements: Dict[Var, Expr] = {tile_idx: iter_expr}
+        for var, buffers in buffered_variables.items():
+            variable_replacements[var] = buffers[slot % len(buffers)]
+
+        for instruction in drain_instructions:
+            replaced_stmt = instruction.instruction.replace_vars(variable_replacements)
+            epilogue_stmts.append(IfStmt(_iter_guard(loop_stmt, tile_idx, iter_expr), replaced_stmt))
+
+    return epilogue_stmts
 
 
 def _declared_var(stmt: Stmt) -> Optional[Var]:
@@ -430,12 +521,12 @@ def pipeline_loop_stmt(
         loop_stmt,
         mode="steady",
     )
-    epilogue_stmts = _build_schedule_stmts(
-        schedule.epilogue,
+    epilogue_stmts = _build_drain_epilogue_stmts(
+        manager,
         tile_idx,
         buffered_variables,
         loop_stmt,
-        mode="epilogue",
+        schedule.num_stages,
     )
 
     step_expr = AssignExpr(tile_idx, BinaryOp(tile_idx, RawExpr(schedule.num_stages), "+"))
