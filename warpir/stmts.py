@@ -19,6 +19,45 @@ class Level(str, Enum):
 
 
 class Expr(ABC):
+    def __init__(self, name: Optional[str] = None):
+        self._inputs: List[Var] = []
+        self._output: Optional[Var] = None
+        self._name: Optional[str] = name
+
+    @property
+    def inputs(self) -> List[Var]:
+        return self._inputs
+
+    @inputs.setter
+    def inputs(self, value: List[Var]):
+        self._inputs = value
+
+    @property
+    def outputs(self) -> List[Var]:
+        return [self._output] if self._output is not None else []
+
+    @outputs.setter
+    def outputs(self, value: List[Var]):
+        if len(value) > 1:
+            raise ValueError("Expr supports at most one output")
+        self._output = value[0] if value else None
+
+    @property
+    def output(self) -> Optional[Var]:
+        return self._output
+
+    @output.setter
+    def output(self, value: Optional[Var]):
+        self._output = value
+
+    @property
+    def name(self) -> str:
+        return self._name if self._name is not None else self.__class__.__name__
+
+    @name.setter
+    def name(self, value: str):
+        self._name = value
+
     @abstractmethod
     def __str__(self) -> str:
         pass
@@ -41,6 +80,35 @@ class Expr(ABC):
         return hash(str(self))
 
 class Stmt(ABC):
+    inputs: List[Var]
+
+    @property
+    def name(self) -> str:
+        return getattr(self, "_name", self.__class__.__name__)
+
+    @name.setter
+    def name(self, value: str):
+        self._name = value
+
+    @property
+    def outputs(self) -> List[Var]:
+        output = getattr(self, "_output", None)
+        return [output] if output is not None else []
+
+    @outputs.setter
+    def outputs(self, value: List[Var]):
+        if len(value) > 1:
+            raise ValueError("Stmt supports at most one output")
+        self._output = value[0] if value else None
+
+    @property
+    def output(self) -> Optional[Var]:
+        return getattr(self, "_output", None)
+
+    @output.setter
+    def output(self, value: Optional[Var]):
+        self._output = value
+
     @abstractmethod
     def __str__(self) -> str:
         pass
@@ -65,7 +133,8 @@ class Stmt(ABC):
 _ENV = Environment(trim_blocks=True, lstrip_blocks=True)
 
 class OpCall(Expr):
-    def __init__(self, function_name: str, inputs: List[Expr]):
+    def __init__(self, function_name: str, inputs: List[Expr], name: Optional[str] = None):
+        super().__init__(name or function_name)
         self.function_name = function_name
         self.inputs = inputs
         
@@ -92,6 +161,7 @@ class ExprStmt(Stmt):
 
 class BinaryOp(Expr):
     def __init__(self, a: Expr, b: Expr, op_type: str):
+        super().__init__(op_type)
         self.a = a 
         self.b = b
         self.op_type = op_type
@@ -106,7 +176,7 @@ class BinaryOp(Expr):
         return expr
 
 class ForStmt(Stmt):
-    def __init__(self, init: Expr, cond: Expr, step: Expr, body: Stmt, inputs: List[Var], yields: List[Var]):
+    def __init__(self, init: Expr, cond: Expr, step: Expr, body: SeqStmt, inputs: List[Var], yields: List[Var]):
         self.init = init
         self.cond = cond
         self.step = step
@@ -174,6 +244,7 @@ class SeqStmt(Stmt):
 
 class RawExpr(Expr):
     def __init__(self, code) -> None:
+        super().__init__()
         self.code = str(code)
     
     def __str__(self) -> str:
@@ -195,6 +266,7 @@ class RawStmt(Stmt):
 
 class AssignExpr(Expr):
     def __init__(self, lhs: Expr, rhs: Expr):
+        super().__init__()
         self.lhs = lhs
         self.rhs = rhs
 
@@ -258,6 +330,7 @@ class DeclStmt(Stmt):
 
 class Var(Expr):
     def __init__(self, name: str, var_type: VarType, parent: Optional[KernelGlobals] = None, annotations: List[str] = []):
+        super().__init__(name)
         self.name = name
         self.var_type = var_type
         self.parent = parent
@@ -295,6 +368,7 @@ class KernelGlobals():
 
 class Coord(Expr):
     def __init__(self, elements: List[Expr]):
+        super().__init__()
         self.elements = elements
 
     def __str__(self) -> str:
@@ -308,6 +382,7 @@ class Coord(Expr):
 
 class SizeBytesExpr(Expr):
     def __init__(self, expr: Expr):
+        super().__init__()
         self.expr = expr
 
     def __str__(self) -> str:
@@ -319,11 +394,13 @@ class SizeBytesExpr(Expr):
         return expr
     
 class TileLoadOp(Stmt):
-    def __init__(self, tile: 'Tile', source: Var, coord: Coord, async_load: bool = False):
+    def __init__(self, tile: 'Tile', source: Var, coord: Coord, async_load: bool = False, name: Optional[str] = None):
         self.tile = tile
         self.source = source
         self.coord = coord
         self.async_load = async_load
+        self.name = name or f"{self.__class__.__name__}_{self.tile.name}"
+        self.output = self.tile
 
     def __str__(self) -> str:
         tag = "async " if self.async_load else ""

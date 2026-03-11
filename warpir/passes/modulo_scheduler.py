@@ -219,21 +219,97 @@ if __name__ == "__main__":
         ExprStmt(OpCall("warpgroup::mma_async_wait", [])),
     ])
 
-    load_a_instruction = MSInstruction("tma", 12, "load_a", a_tile.var, [], load_a_stmt)
-    load_b_instruction = MSInstruction("tma", 12, "load_b", b_tile.var, [], load_b_stmt)
-    mac_instruction = MSInstruction("tc", 4, "mac", c_tile.var, [], mac_stmt)
+    zero_c_op = ExprStmt(OpCall("warpgroup::zero", [c_tile]))
+    store_op = ExprStmt(OpCall("warpgroup::store", [c_tile, Coord([RawExpr(0), RawExpr(0), row, col])]))
 
-    for load_instr in [load_a_instruction, load_b_instruction]:
-        mac_instruction.parent_edges.append(
-            MSInstructionEdge(source=load_instr, dest=mac_instruction, distance=0)
-        )
-    mac_instruction.parent_edges.append(
-        MSInstructionEdge(source=mac_instruction, dest=mac_instruction, distance=1)
+    loop = ForStmt(
+        AssignExpr(tile_idx, RawExpr(0)),
+        BinaryOp(tile_idx, tile_limit, "<"),
+        AssignExpr(tile_idx, BinaryOp(tile_idx, RawExpr(1), "+")),
+        SeqStmt([load_a_stmt, load_b_stmt, mac_stmt]),
+        inputs=[c_tile],
+        yields=[c_tile]
     )
 
-    for instr in [load_a_instruction, load_b_instruction, mac_instruction]:
-        manager.add_instruction(instr)
+    program_body = SeqStmt(
+        [
+            a_tile.declare(),
+            b_tile.declare(),
+            c_tile.declare(),
+            zero_c_op,
+            loop,
+            store_op
+        ]
+    )
 
+    # TODO: break the following code out into a function 
+    variable_map = {}
+    for_stmt_map = {}
+    for op in program_body.stmts:
+        if type(op) == ForStmt:
+            manager = MSInstructionManager()
+
+            producer_of: Dict[Var, MSInstruction] = {}
+            instruction_map: Dict[Stmt, MSInstruction] = {}
+
+            for inst in op.body.stmts:
+                # TODO: clean up the code here to be more generic with the way this is applied
+                if type(inst) == TileLoadOp:
+                    assert inst.output, "there must be an output"
+                    ms_instruction = MSInstruction("tma", 12, inst.name, inst.output, [], inst)
+                    producer_of[inst.output] = ms_instruction
+                    instruction_map[inst] = ms_instruction
+                # TODO: manage the OpCall properly
+                elif type(inst) == OpCall: # TODO: fix the discrepancy between Expr and Stmt here
+                    ms_instruction = MSInstruction("tc", 4, inst.name, inst.output, [], inst)
+                    producer_of[inst.output] = ms_instruction
+                    instruction_map[inst] = ms_instruction
+                else:
+                    pass
+        
+            for inst in op.body.stmts:
+                for input_var in inst.inputs:
+                    if input_var in instruction_map:
+                        edge = MSInstructionEdge(
+                            source=producer_of[input_var],
+                            dest=instruction_map[inst],
+                            distance=(1 if input_var in op.yields else 0)
+                        )
+                        instruction_map[inst].parent_edges.append(edge)
+            
+            for instruction in instruction_map.values():
+                manager.add_instruction(instruction)
+
+            pipelined_variable_replacements, new_sequence = [] # TODO: implement this portion to check which variables have just gotten renamed. this would largely be based ont he code that I have below
+            print("manager: ", manager)    
+    
+    # TODO: the code that I have described below is pretty rough and rudimentary, needs to be made more formal
+    new_sequence = []
+    for op in program_body.stmts:
+        if type(op) == ForStmt:
+            new_sequence.append(for_stmt_map[op])
+        else:
+            for replacement_var in variable_map:
+                if replacement_var in instruction:
+                    #TODO: duplicate the instruction for the number of times this occurs as a buffered variable (as i think this is how it should work)
+                    #TODO: do the replacement with each element
+
+    # load_a_instruction = MSInstruction("tma", 12, "load_a", a_tile.var, [], load_a_stmt)
+    # load_b_instruction = MSInstruction("tma", 12, "load_b", b_tile.var, [], load_b_stmt)
+    # mac_instruction = MSInstruction("tc", 4, "mac", c_tile.var, [], mac_stmt)
+
+    # for load_instr in [load_a_instruction, load_b_instruction]:
+    #     mac_instruction.parent_edges.append(
+    #         MSInstructionEdge(source=load_instr, dest=mac_instruction, distance=0)
+    #     )
+    # mac_instruction.parent_edges.append(
+    #     MSInstructionEdge(source=mac_instruction, dest=mac_instruction, distance=1)
+    # )
+
+    # for instr in [load_a_instruction, load_b_instruction, mac_instruction]:
+    #     manager.add_instruction(instr)
+
+    # TODO: the task of producing a proper loop from the MSInstructionManager needs to be split out into another function
     prologue, steady_state, epilogue, ii_value, num_stages, stage_of = manager.solve(
         max_cycles,
         depth,
@@ -246,9 +322,7 @@ if __name__ == "__main__":
     print("Stage of: ", stage_of)
 
     variable_buffer_sizes: Dict[Var, int] = {
-        a_tile.var: 1,
-        b_tile.var: 1,
-        c_tile.var: 1,
+        var: 1 for var in variable_map.keys()
     }
     for instruction in manager.instructions:
         for parent_edge in instruction.parent_edges:
@@ -284,6 +358,9 @@ if __name__ == "__main__":
         inputs=[tile_idx, c_tile.var],
         yields=[c_tile.var],
     )
+
+    # TODO: this code needs to be integrated with the code above (which actually takes a holistic view of the code and generates everything including non-loop-related code)
+    # just look here for the sort of standard thing. 
     kernel_stmt = SeqStmt([
         a_tile.declare(),
         b_tile.declare(),
