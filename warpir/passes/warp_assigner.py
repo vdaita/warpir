@@ -159,7 +159,6 @@ if __name__ == "__main__":
     mul2 = generate_mul_instruction("mac", 2, [load_as[2], load_bs[2], mul1])
     mul3 = generate_mul_instruction("mac", 3, [load_as[3], load_bs[3], mul2])
 
-<<<<<<< HEAD:warpir/passes/warp_assigner.py
     load_as: Dict[int, WAInstruction] = {}
     load_bs: Dict[int, WAInstruction] = {}
     macs:    Dict[int, WAInstruction] = {}
@@ -202,10 +201,3 @@ if __name__ == "__main__":
     manager.solve(max_cycles, num_warps, synchronization_cost, ["load_a", "load_b", "mac"], use_verbose)
 
 # TODO: convert instructions into WAInstructions
-=======
-    instructions = load_as + load_bs + [mul0, mul1, mul2, mul3]
-    for instruction in instructions:
-        manager.add_instruction(instruction)
-    
-    manager.solve(max_cycles, num_warps, synchronization_cost, instructions, use_verbose=use_verbose)
->>>>>>> parent of 5b96398 (warp assignments may be cooked):warpir_v2/passes/warp_assigner.py
