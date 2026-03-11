@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from jinja2 import Template
 from warpir.layouts import SharedVecType
 from typing import Optional, Sequence, Union, List, Dict, TYPE_CHECKING
@@ -26,7 +27,7 @@ class Expr(ABC):
         return ExprStmt(self)
 
     def replace_vars(self, replacements: Dict['Var', 'Expr']) -> 'Expr':
-        return self
+        return deepcopy(self)
 
     def replace_var(self, var: 'Var', replacement: 'Expr') -> 'Expr':
         return self.replace_vars({var: replacement})
@@ -45,13 +46,13 @@ class Stmt(ABC):
         pass
 
     def replace_vars(self, replacements: Dict['Var', 'Expr']) -> 'Stmt':
-        return self
+        return deepcopy(self)
 
     def replace_var(self, var: 'Var', replacement: 'Expr') -> 'Stmt':
         return self.replace_vars({var: replacement})
 
     def remove_var(self, var: 'Var') -> 'Stmt':
-        return self
+        return deepcopy(self)
 
     def __eq__(self, other):
         if not isinstance(other, Stmt):
@@ -73,8 +74,9 @@ class OpCall(Expr):
         return f"{self.function_name}({expr_list})"
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> Expr:
-        self.inputs = [inp.replace_vars(replacements) for inp in self.inputs]
-        return self
+        expr = deepcopy(self)
+        expr.inputs = [inp.replace_vars(replacements) for inp in expr.inputs]
+        return expr
 
 class ExprStmt(Stmt):
     def __init__(self, call: Expr):
@@ -84,8 +86,9 @@ class ExprStmt(Stmt):
         return f"{self.call};"
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> 'ExprStmt':
-        self.call = self.call.replace_vars(replacements)
-        return self
+        stmt = deepcopy(self)
+        stmt.call = stmt.call.replace_vars(replacements)
+        return stmt
 
 class BinaryOp(Expr):
     def __init__(self, a: Expr, b: Expr, op_type: str):
@@ -97,9 +100,10 @@ class BinaryOp(Expr):
         return f"({self.a} {self.op_type} {self.b})"
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> Expr:
-        self.a = self.a.replace_vars(replacements)
-        self.b = self.b.replace_vars(replacements)
-        return self
+        expr = deepcopy(self)
+        expr.a = expr.a.replace_vars(replacements)
+        expr.b = expr.b.replace_vars(replacements)
+        return expr
 
 class ForStmt(Stmt):
     def __init__(self, init: Expr, cond: Expr, step: Expr, body: Stmt, inputs: List[Var], yields: List[Var]):
@@ -121,15 +125,17 @@ class ForStmt(Stmt):
         return tmpl.render(init=init, cond=str(self.cond), step=step, body=body)
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> 'ForStmt':
-        self.init = self.init.replace_vars(replacements)
-        self.cond = self.cond.replace_vars(replacements)
-        self.step = self.step.replace_vars(replacements)
-        self.body = self.body.replace_vars(replacements)
-        return self
+        stmt = deepcopy(self)
+        stmt.init = stmt.init.replace_vars(replacements)
+        stmt.cond = stmt.cond.replace_vars(replacements)
+        stmt.step = stmt.step.replace_vars(replacements)
+        stmt.body = stmt.body.replace_vars(replacements)
+        return stmt
 
     def remove_var(self, var: 'Var') -> 'ForStmt':
-        self.body = self.body.remove_var(var)
-        return self
+        stmt = deepcopy(self)
+        stmt.body = stmt.body.remove_var(var)
+        return stmt
 
 class NoStmt(Stmt):
     def __init__(self):
@@ -152,17 +158,19 @@ class SeqStmt(Stmt):
         return "\n".join(rendered)
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> 'SeqStmt':
-        self.stmts = [stmt.replace_vars(replacements) for stmt in self.stmts]
-        return self
+        stmt = deepcopy(self)
+        stmt.stmts = [child.replace_vars(replacements) for child in stmt.stmts]
+        return stmt
 
     def remove_var(self, var: 'Var') -> 'SeqStmt':
+        stmt = deepcopy(self)
         filtered: List[Stmt] = []
-        for stmt in self.stmts:
-            if isinstance(stmt, DeclStmt) and stmt.var == var:
+        for child in stmt.stmts:
+            if isinstance(child, DeclStmt) and child.var == var:
                 continue
-            filtered.append(stmt.remove_var(var))
-        self.stmts = filtered
-        return self
+            filtered.append(child.remove_var(var))
+        stmt.stmts = filtered
+        return stmt
 
 class RawExpr(Expr):
     def __init__(self, code) -> None:
@@ -172,7 +180,7 @@ class RawExpr(Expr):
         return self.code.rstrip()
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> Expr:
-        return self
+        return deepcopy(self)
 zero, one = RawExpr(0), RawExpr(1)
 
 class RawStmt(Stmt):
@@ -183,7 +191,7 @@ class RawStmt(Stmt):
         return self.code.rstrip()
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> 'RawStmt':
-        return self
+        return deepcopy(self)
 
 class AssignExpr(Expr):
     def __init__(self, lhs: Expr, rhs: Expr):
@@ -195,9 +203,10 @@ class AssignExpr(Expr):
         return tmpl.render(lhs=str(self.lhs), rhs=str(self.rhs))
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> Expr:
-        self.lhs = self.lhs.replace_vars(replacements)
-        self.rhs = self.rhs.replace_vars(replacements)
-        return self
+        expr = deepcopy(self)
+        expr.lhs = expr.lhs.replace_vars(replacements)
+        expr.rhs = expr.rhs.replace_vars(replacements)
+        return expr
 
 class IfStmt(Stmt):
     def __init__(self, cond: Expr, then_stmt: Stmt, else_stmt: Optional[Stmt] = None):
@@ -214,17 +223,19 @@ class IfStmt(Stmt):
         return tmpl.render(cond=str(self.cond), then_body=then_body, else_body=else_body)
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> 'IfStmt':
-        self.cond = self.cond.replace_vars(replacements)
-        self.then_stmt = self.then_stmt.replace_vars(replacements)
-        if self.else_stmt is not None:
-            self.else_stmt = self.else_stmt.replace_vars(replacements)
-        return self
+        stmt = deepcopy(self)
+        stmt.cond = stmt.cond.replace_vars(replacements)
+        stmt.then_stmt = stmt.then_stmt.replace_vars(replacements)
+        if stmt.else_stmt is not None:
+            stmt.else_stmt = stmt.else_stmt.replace_vars(replacements)
+        return stmt
 
     def remove_var(self, var: 'Var') -> 'IfStmt':
-        self.then_stmt = self.then_stmt.remove_var(var)
-        if self.else_stmt is not None:
-            self.else_stmt = self.else_stmt.remove_var(var)
-        return self
+        stmt = deepcopy(self)
+        stmt.then_stmt = stmt.then_stmt.remove_var(var)
+        if stmt.else_stmt is not None:
+            stmt.else_stmt = stmt.else_stmt.remove_var(var)
+        return stmt
 
 def lane0_if(stmt: Stmt) -> Stmt:
     return IfStmt(BinaryOp(RawExpr("0"), RawExpr("warpgroup::laneid()"), "=="), stmt)
@@ -269,7 +280,7 @@ class Var(Expr):
         return hash(str(self))
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> Expr:
-        return replacements.get(self, self)
+        return replacements.get(self, deepcopy(self))
 
 class KernelGlobals():
     def __init__(self, name: str):
@@ -291,8 +302,9 @@ class Coord(Expr):
         return "{" + elem_list + "}"
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> Expr:
-        self.elements = [element.replace_vars(replacements) for element in self.elements]
-        return self
+        coord = deepcopy(self)
+        coord.elements = [element.replace_vars(replacements) for element in coord.elements]
+        return coord
 
 class SizeBytesExpr(Expr):
     def __init__(self, expr: Expr):
@@ -302,8 +314,9 @@ class SizeBytesExpr(Expr):
         return f"size_bytes<typeof({self.expr})>"
     
     def replace_vars(self, replacements: Dict['Var', Expr]) -> Expr:
-        self.expr = self.expr.replace_vars(replacements)
-        return self
+        expr = deepcopy(self)
+        expr.expr = expr.expr.replace_vars(replacements)
+        return expr
     
 class TileLoadOp(Stmt):
     def __init__(self, tile: 'Tile', source: Var, coord: Coord, async_load: bool = False):
@@ -317,10 +330,11 @@ class TileLoadOp(Stmt):
         return f"{tag}TileLoad({self.tile}, {self.source}, {self.coord})"
 
     def replace_vars(self, replacements: Dict['Var', Expr]) -> 'TileLoadOp':
-        self.tile = self.tile.replace_vars(replacements)
-        self.source = self.source.replace_vars(replacements)
-        self.coord = self.coord.replace_vars(replacements)
-        return self
+        stmt = deepcopy(self)
+        stmt.tile = stmt.tile.replace_vars(replacements)
+        stmt.source = stmt.source.replace_vars(replacements)
+        stmt.coord = stmt.coord.replace_vars(replacements)
+        return stmt
 
     def lower(self) -> Stmt:
         if self.async_load:

@@ -13,6 +13,9 @@ class MSInstructionEdge:
     dest: 'MSInstruction'
     distance: int
 
+def stringify_dict(in_dict):
+    return {str(k): str(v) for k, v in variable_replacements.items()}
+
 @dataclass
 class MSInstruction:
     resource: Union[str, Tuple[str, ...]]
@@ -130,36 +133,36 @@ class MSInstructionManager:
             ) + 1
             
             # prologue: list of steps, each step is list of (logical_iter, inst_name)
-            prologue = []
+            prologue: List[List[Tuple[int, MSInstruction]]] = []
             for i in range(num_stages - 1):
-                step = []
+                step: List[Tuple[int, MSInstruction]] = []
                 for instruction in self.instructions:
                     if stage_of[instruction.name] <= i:
-                        step.append((i - stage_of[instruction.name], instruction.name))
+                        step.append((i - stage_of[instruction.name], instruction))
                 prologue.append(step)
 
             # steady state: grouped by k, each entry is list of (inst_name, buffer_offset)
-            steady_state = []
-            for k in range(num_stages - 1, depth):
+            steady_state: List[List[Tuple[int, MSInstruction]]] = []
+            for k in range(num_stages - 1, min(depth, num_stages - 1 + num_stages)):
                 step = []
                 for instruction in self.instructions:
-                    step.append((instruction.name, k - stage_of[instruction.name]))
+                    step.append(((k - stage_of[instruction.name]), instruction))
                 steady_state.append(step)
 
             # epilogue: list of drain steps, each is list of (inst_name, buffer_offset)
-            epilogue = []
+            epilogue: List[List[Tuple[int, MSInstruction]]] = []
             for i in range(1, num_stages):
                 step = []
                 for instruction in self.instructions:
                     if stage_of[instruction.name] >= i:
-                        step.append((instruction.name, stage_of[instruction.name] - i))
+                        step.append((stage_of[instruction.name] - 1, instruction))
                 epilogue.append(step)
 
             return prologue, steady_state, epilogue, ii_value, num_stages, stage_of
 
         else:
             print("No solution found.")
-            return None, None, None, None, None, None
+            raise ValueError("Modulo scheduler pass cannot be applied. Please remove this pass.")
 
 if __name__ == "__main__":
     manager = MSInstructionManager()
@@ -268,38 +271,6 @@ if __name__ == "__main__":
 
     instruction_lookup = {instr.name: instr for instr in manager.instructions}
 
-    def format_stage_entries(entries, stage_kind: str) -> List[str]:
-        lines: List[str] = []
-        if stage_kind == "prologue":
-            for offset, inst_name in entries:
-                inst = instruction_lookup[inst_name]
-                lines.append(
-                    f"{inst_name} (iter delta {offset}): {inst.instruction}"
-                )
-        elif stage_kind == "steady":
-            for inst_name, buffer_offset in entries:
-                inst = instruction_lookup[inst_name]
-                lines.append(
-                    f"{inst_name} (buffer offset {buffer_offset}): {inst.instruction}"
-                )
-        else:
-            for inst_name, drain_offset in entries:
-                inst = instruction_lookup[inst_name]
-                lines.append(
-                    f"{inst_name} (drain offset {drain_offset}): {inst.instruction}"
-                )
-        return lines
-
-    def dump_schedule(label: str, stages, stage_kind: str):
-        for idx, stage_entries in enumerate(stages):
-            print(f"{label} stage {idx}:")
-            for line in format_stage_entries(stage_entries, stage_kind):
-                print("  ", line)
-
-    dump_schedule("Prologue", prologue, "prologue")
-    dump_schedule("Steady", steady_state, "steady")
-    dump_schedule("Epilogue", epilogue, "epilogue")
-
     kernel_globals = KernelGlobals("globals")
     for shared in [A, B, C, N]:
         kernel_globals.add_var(shared)
@@ -310,7 +281,7 @@ if __name__ == "__main__":
         BinaryOp(tile_idx, tile_limit, "<"),
         AssignExpr(tile_idx, BinaryOp(tile_idx, RawExpr(1), "+")),
         loop_body,
-        inputs=[tile_idx],
+        inputs=[tile_idx, c_tile.var],
         yields=[c_tile.var],
     )
     kernel_stmt = SeqStmt([
@@ -329,125 +300,88 @@ if __name__ == "__main__":
     print("Sample IR (after lowering):")
     print(lowered_sample_program.kernel_stmt)
 
-    
-    # Algorithm to convert 
-
-    # first generate all of the buffered variables (tiles and their lowered vars)
-    var_to_tile = {
-        a_tile.var: a_tile,
-        b_tile.var: b_tile,
-        c_tile.var: c_tile,
-    }
-
     buffered_variables: Dict[Var, List[Var]] = {}
-    tile_buffer_map: Dict[Tile, List[Tile]] = {}
     for var, size in variable_buffer_sizes.items():
-        tile = var_to_tile.get(var)
-        buffered_vars: List[Var] = []
+        buffered_variables[var] = []
         for buf_id in range(size):
-            if tile is not None:
-                clone = Tile(
-                    f"{tile.name}_{buf_id}",
-                    tile.var_type,
-                    tile.use_semaphores,
-                    tile.num_consumers,
-                )
-                buffered_vars.append(clone)
-                tile_buffer_map.setdefault(tile, []).append(clone)
-            else:
-                clone_var = deepcopy(var)
-                clone_var.name = f"{var.name}_{buf_id}"
-                buffered_vars.append(clone_var)
-        buffered_variables[var] = buffered_vars
-
-    def buffer_index(offset: int, var: Var) -> int:
-        candidates = buffered_variables.get(var, [])
-        return offset % len(candidates) if candidates else 0
-
-    def instantiate_instruction(
-        inst_name: str,
-        iteration_expr: Expr,
-        buffer_offset: int
-    ) -> Stmt:
-        instruction = deepcopy(instruction_lookup[inst_name].instruction)
-        replacements: Dict[Var, Expr] = {tile_idx: iteration_expr}
-        output_var = instruction_lookup[inst_name].output_var
-        candidates = buffered_variables.get(output_var, [])
-        if candidates:
-            idx = buffer_index(buffer_offset, output_var)
-            replacements[output_var] = candidates[idx]
-            output_tile = var_to_tile.get(output_var)
-            if output_tile is not None and output_tile in tile_buffer_map:
-                clones = tile_buffer_map[output_tile]
-                replacements[output_tile] = clones[idx]
-                replacements[output_tile.var] = clones[idx]
-
-        for buffered_var, clones in buffered_variables.items():
-            if not clones or buffered_var in replacements:
-                continue
-            idx = buffer_index(buffer_offset, buffered_var)
-            replacements[buffered_var] = clones[idx]
-            tile = var_to_tile.get(buffered_var)
-            if tile is not None and tile in tile_buffer_map:
-                clones_for_tile = tile_buffer_map[tile]
-                replacements[tile] = clones_for_tile[idx]
-                replacements[tile.var] = clones_for_tile[idx]
-
-        return instruction.replace_vars(replacements)
+            clone_var = deepcopy(var)
+            clone_var.name = f"{var.name}_{buf_id}"
+            buffered_variables[var].append(clone_var)
 
     prologue_stmts: List[Stmt] = []
     for stage_idx, stage_entries in enumerate(prologue):
-        for iter_delta, inst_name in stage_entries:
-            iteration_value = max(stage_idx - iter_delta, 0)
-            iteration_expr = RawExpr(str(iteration_value))
+        for iter_delta, instruction in stage_entries:
+            # all of the input variables that go into this are handled b
+            variable_replacements: Dict[Var, Expr] = {
+                # tile_idx: BinaryOp(tile_idx, RawExpr(iter_delta), "+"),
+                tile_idx: RawExpr(stage_idx) # right?
+            }
+            for var in buffered_variables:
+                variable_replacements[var] = buffered_variables[var][iter_delta % variable_buffer_sizes[var]]
+        
+            print("In prologue instruction ", instruction.instruction, " with stage ", stage_idx, " and iter_delta ", iter_delta, " using following map: ", stringify_dict(variable_replacements))
+
             prologue_stmts.append(
-                instantiate_instruction(inst_name, iteration_expr, iter_delta)
+                instruction.instruction.replace_vars(variable_replacements)
             )
+    
+    print("=========")
 
-    steady_stmts: List[Stmt] = []
-    for entries in steady_state:
-        for inst_name, buffer_offset in entries:
-            steady_stmts.append(
-                instantiate_instruction(inst_name, tile_idx, buffer_offset)
-            )
+    steady_state_stmts: List[Stmt] = []
+    for stage_idx, stage_entries in enumerate(steady_state):
+        for iter_delta, instruction in stage_entries:
+            variable_replacements: Dict[Var, Expr] = {
+                tile_idx: BinaryOp(tile_idx, RawExpr(iter_delta), "+")
+            }
+            for var in buffered_variables:
+                variable_replacements[var] = buffered_variables[var][iter_delta % variable_buffer_sizes[var]]
+            if_wrapper = IfStmt(BinaryOp(BinaryOp(tile_idx, RawExpr(iter_delta), "+"), N, "<"), instruction.instruction.replace_vars(variable_replacements))
+            print("In steady state instruction ", instruction.instruction, " with stage ", stage_idx, " and iter_delta ", iter_delta, " using following map: ", stringify_dict(variable_replacements))
+            steady_state_stmts.append(if_wrapper)
 
-    def make_epilogue_expr(drain_offset: int) -> Expr:
-        return BinaryOp(
-            BinaryOp(tile_limit, RawExpr(1), "-"),
-            RawExpr(drain_offset),
-            "-"
-        )
-
+    print("========")
+    
     epilogue_stmts: List[Stmt] = []
-    for entries in epilogue:
-        for inst_name, drain_offset in entries:
-            epilogue_stmts.append(
-                instantiate_instruction(inst_name, make_epilogue_expr(drain_offset), drain_offset)
-            )
-
-    buffered_declarations: List[Stmt] = []
-    for clones in buffered_variables.values():
-        buffered_declarations.extend([clone.declare() for clone in clones])
-
-    steady_body = SeqStmt(steady_stmts)
-    pipelined_tile_loop = ForStmt(
-        AssignExpr(tile_idx, zero),
-        BinaryOp(tile_idx, tile_limit, "<"),
-        AssignExpr(tile_idx, BinaryOp(tile_idx, RawExpr(1), "+")),
-        steady_body,
-        inputs=[tile_idx],
-        yields=[buffered_variables[c_tile.var][0]],
+    for stage_idx, stage_entries in enumerate(epilogue):
+        for iter_delta, instruction in stage_entries:
+            variable_replacements: Dict[Var, Expr] = {
+                tile_idx: BinaryOp(tile_idx, RawExpr(iter_delta), "-")
+            }
+            for var in buffered_variables:
+                variable_replacements[var] = buffered_variables[var][iter_delta % variable_buffer_sizes[var]]
+            print("In epilogue instruction ", instruction.instruction, " with stage ", stage_idx, " and iter_delta ", iter_delta, " using following map: ", stringify_dict(variable_replacements))
+            epilogue_stmts.append(instruction.instruction.replace_vars(variable_replacements))
+    
+    final_kernel = []
+    for stmt in kernel_stmt.stmts:
+        if type(stmt) == DeclStmt:
+            if stmt.var in buffered_variables:
+                for instance in buffered_variables[stmt.var]:
+                    final_kernel.append(instance.declare())
+        else:
+            # figure out if there is a command or somethign that concerns another member
+                # will need to deal with this for the zero operation
+            pass
+    
+    final_kernel.extend(prologue_stmts)
+    for_inputs = [tile_idx]
+    for var in buffered_variables:
+        for x in buffered_variables[var]:
+            for_inputs.append(x)
+    new_for_loop = ForStmt(
+        tile_loop.init,
+        tile_loop.cond,
+        AssignExpr(tile_idx, BinaryOp(tile_idx, RawExpr(num_stages), "+")),
+        SeqStmt(steady_state_stmts),
+        inputs=for_inputs,
+        yields=[]
     )
+    final_kernel.append(new_for_loop)
+    final_kernel.extend(epilogue_stmts)
 
-    pipelined_kernel_stmt = SeqStmt(
-        buffered_declarations
-        + [tile_idx.declare()]
-        + prologue_stmts
-        + [pipelined_tile_loop]
-        + epilogue_stmts
-    )
+    final_kernel_stmt = SeqStmt(final_kernel)
 
-    pipelined_program = Program(kernel_globals, pipelined_kernel_stmt)
+    pipelined_program = Program(kernel_globals, final_kernel_stmt)
     print("Pipelined IR:")
     print(pipelined_program.kernel_stmt)
 
