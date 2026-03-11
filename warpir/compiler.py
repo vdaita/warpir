@@ -4,8 +4,7 @@ from pathlib import Path
 from typing import Optional
 from subprocess import PIPE, run
 
-from .flow import Program
-
+from warpir.helpers import Program
 
 def format_cpp(code: str) -> str:
     """
