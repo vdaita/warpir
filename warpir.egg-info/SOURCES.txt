@@ -1,10 +1,8 @@
 README.md
 pyproject.toml
+tests/test_gemm_baseline.py
+tests/test_modal_gpu.py
 warpir/__init__.py
-warpir/compiler.py
-warpir/flow.py
-warpir/layouts.py
-warpir/main.py
 warpir.egg-info/PKG-INFO
 warpir.egg-info/SOURCES.txt
 warpir.egg-info/dependency_links.txt

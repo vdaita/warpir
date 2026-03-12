@@ -11,3 +11,4 @@ scipy>=1.15.3
 graphviz>=0.21
 ortools>=9.15.6755
 rich>=14.3.3
+modal>=0.73.0

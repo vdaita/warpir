@@ -51,6 +51,27 @@ class GlobalType:
 
 
 @dataclass(frozen=True)
+class SharedBufferType:
+    """Mutable shared memory buffer array (not an SSA value)."""
+    tile_type: SharedTileType
+    count: int
+
+    def __str__(self) -> str:
+        return f"shared_buffer<{self.tile_type}, count={self.count}>"
+
+
+@dataclass(frozen=True)
+class ColVecType:
+    """Register column vector — col_vec<rt<data_type, rows, cols>>."""
+    data_type: GPUType
+    rows: int
+    cols: int
+
+    def __str__(self) -> str:
+        return f"col_vec<{self.data_type.value}, {self.rows}x{self.cols}>"
+
+
+@dataclass(frozen=True)
 class ScalarType:
     name: str
 
@@ -63,4 +84,4 @@ class IntType(ScalarType):
         super().__init__("int")
 
 
-TypeRef = Union[GlobalType, IntType, SharedTileType, RegTileType]
+TypeRef = Union[GlobalType, IntType, SharedTileType, RegTileType, SharedBufferType, ColVecType]

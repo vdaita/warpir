@@ -92,10 +92,10 @@ if __name__ == "__main__":
     from pathlib import Path
     from warpir.printing import print_kernel
     from warpir.lowering import ThunderKittensLowerer
-    from warpir.passes import modulo_scheduler
+    from warpir.passes.modulo_scheduler import kernel_pass
 
     kernel = build_gemm_kernel()
-    pipelined_kernel = modulo_scheduler.kernel_pass(kernel)
+    pipelined_kernel = kernel_pass(kernel)
 
     print("=== IR ===")
     print_kernel(kernel)
@@ -119,8 +119,9 @@ if __name__ == "__main__":
     out_path = Path(__file__).parent / "outputs" / "gemm_baseline.cu"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(cuda_src)
+    print(f"Wrote {out_path}")
     
     out_path_pipelined = Path(__file__).parent / "outputs" / "gemm_baseline_pipelined.cu"
-    out_path.write_text(cuda_src_pipelined)
+    out_path_pipelined.write_text(cuda_src_pipelined)
     
-    print(f"Wrote {out_path}")
+    print(f"Wrote {out_path_pipelined}")
