@@ -151,8 +151,8 @@ class ThunderKittensLowerer:
     def _analyze_buffer_ops(self, ops: tuple[Op, ...]) -> None:
         for op in ops:
             if isinstance(op, AllocSharedOp):
-                self._buf_allocations[op.result.name] = op.result.type
                 if isinstance(op.result.type, SharedBufferType):
+                    self._buf_allocations[op.result.name] = op.result.type
                     self._buf_num_stages = max(
                         self._buf_num_stages, op.result.type.count,
                     )
@@ -492,21 +492,34 @@ class ThunderKittensLowerer:
             return lines
 
         if isinstance(op, MMABufOp):
+            a_is_buf = op.a_buf.name in self._buf_allocations
+            b_is_buf = op.b_buf.name in self._buf_allocations
+
+            if a_is_buf:
+                a_idx = self._render_buf_idx(op.a_slot, op.a_buf.name)
+                a_expr = f"{op.a_buf.name}[{a_idx}]"
+            else:
+                a_expr = self._val_name(op.a_buf)
+
+            if b_is_buf:
+                b_idx = self._render_buf_idx(op.b_slot, op.b_buf.name)
+                b_expr = f"{op.b_buf.name}[{b_idx}]"
+            else:
+                b_expr = self._val_name(op.b_buf)
+
+            result = self._val_name(op.result)
             accum = self._val_name(op.accum)
-            a_idx = self._render_buf_idx(op.a_slot, op.a_buf.name)
-            b_idx = self._render_buf_idx(op.b_slot, op.b_buf.name)
-            lines = [
-                f"{pad}warpgroup::mma_AB({accum}, "
-                f"{op.a_buf.name}[{a_idx}], {op.b_buf.name}[{b_idx}]);",
-                f"{pad}warpgroup::mma_async_wait();",
-                f"{pad}__syncthreads();",
-            ]
-            # Advance drain counter after each MMA
-            mod = op.a_slot.modulus if isinstance(op.a_slot, BufSlotExpr) else 0
-            if mod:
-                lines.append(
-                    f"{pad}_compute_buf = (_compute_buf + 1) % {mod};"
-                )
+            lines: list[str] = []
+            if op.transpose_b:
+                lines.append(f"{pad}warpgroup::mm_ABt({result}, {a_expr}, {b_expr});")
+            else:
+                if result != accum:
+                    lines.append(
+                        f"{pad}kittens::warp::copy({result}, {accum});"
+                    )
+                lines.append(f"{pad}warpgroup::mma_AB({result}, {a_expr}, {b_expr});")
+            lines.append(f"{pad}warpgroup::mma_async_wait();")
+            lines.append(f"{pad}__syncthreads();")
             return lines
 
         if isinstance(op, CopyOp):

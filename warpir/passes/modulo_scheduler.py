@@ -20,7 +20,7 @@ from warpir.ir.ops import (
     WaitOp,
     YieldOp,
 )
-from warpir.ir.types import SharedBufferType
+from warpir.ir.types import SharedBufferType, SharedTileType
 
 @dataclass
 class MSInstructionEdge:
@@ -86,7 +86,7 @@ class MSInstructionManager:
                 resource_counts[resource]
             )
                     
-        ii = model.new_int_var(0, max_cycles - 1, "ii")
+        ii = model.new_int_var(1, max_cycles - 1, "ii")
         for instruction in self.instructions:
             for i in range(0, depth - 1):
                 model.add(
@@ -159,16 +159,43 @@ class MSInstructionManager:
                         step.append((instruction.name, stage_of[instruction.name] - i))
                 epilogue.append(step)
 
-            return prologue, steady_state, epilogue, ii_value, num_stages, stage_of
+            return prologue, steady_state, epilogue, ii_value, num_stages, stage_of, kernel_start
 
         else:
-            # print("No solution found.")
-            return None, None, None, None, None, None
+            raise ValueError("No solution found!")
 
-def kernel_pass(kernel: Kernel) -> Kernel:
-    resource_counts = {"tma": 4, "tc": 1}
-    max_cycles = 100
-    depth = 5
+
+def _iter_value_operands(x):
+    if isinstance(x, Value):
+        yield x
+        return
+    if isinstance(x, BufSlotExpr):
+        if x.value is not None:
+            yield x.value
+        return
+    if isinstance(x, tuple):
+        for e in x:
+            yield from _iter_value_operands(e)
+        return
+
+
+def _op_schedule_info(op: Op) -> Union[Tuple[str, int], None]:
+    if isinstance(op, TMALoadOp):
+        return ("tma", 12)
+    if isinstance(op, TMAStoreOp):
+        return ("tma", 12)
+    if isinstance(op, MMAOp):
+        return ("tc", 4)
+    if isinstance(op, WaitOp):
+        return ("cuda", 1)
+    if isinstance(op, YieldOp):
+        return None
+    return ("cuda", 1)
+
+def kernel_pass(kernel: Kernel, max_pipeline_depth: Union[int, None] = None) -> Kernel:
+    resource_counts = {"tma": 4, "tc": 1, "cuda": 1}
+    max_cycles = 5000
+    depth = 10
     use_verbose = False
 
     new_body = []
@@ -179,22 +206,28 @@ def kernel_pass(kernel: Kernel) -> Kernel:
 
         manager = MSInstructionManager()
         instructions: Dict[str, MSInstruction] = {}
+        instr_order: Dict[str, int] = {}
 
-        for body_op in op.body:
-            instr = None
-            if type(body_op) == TMALoadOp:
-                instr = MSInstruction(resource="tma", latency=12, name=str(body_op), parent_edges=[])
-            elif type(body_op) == MMAOp:
-                instr = MSInstruction(resource="tc", latency=4, name=str(body_op), parent_edges=[])
-            elif type(body_op) == TMAStoreOp:
-                instr = MSInstruction(resource="tma", latency=12, name=str(body_op), parent_edges=[])
-            if instr:
-                instructions[str(body_op)] = instr
+        for idx, body_op in enumerate(op.body):
+            sched = _op_schedule_info(body_op)
+            if sched is None:
+                continue
+            resource, latency = sched
+            instr = MSInstruction(
+                resource=resource,
+                latency=latency,
+                name=str(body_op),
+                parent_edges=[],
+            )
+            instructions[str(body_op)] = instr
+            instr_order[str(body_op)] = idx
 
         emitter_map: Dict[Value, MSInstruction] = {}
         for body_op in op.body:
-            if type(body_op) in (TMALoadOp, MMAOp):
-                emitter_map[body_op.result] = instructions[str(body_op)]
+            if hasattr(body_op, "result") and isinstance(getattr(body_op, "result"), Value):
+                op_key = str(body_op)
+                if op_key in instructions:
+                    emitter_map[getattr(body_op, "result")] = instructions[op_key]
 
         yielded_values: set = {ia.block_arg for ia in op.iter_args}
         yield_op = next(o for o in op.body if isinstance(o, YieldOp))
@@ -208,18 +241,27 @@ def kernel_pass(kernel: Kernel) -> Kernel:
                 continue
             instr = instructions[str(body_op)]
             input_fields = {k: v for k, v in vars(body_op).items() if k != 'result'}
-            for operand in (v for v in input_fields.values() if isinstance(v, Value)):
-                distance = 1 if operand in yielded_values else 0
-                source_val = iter_arg_to_yield.get(operand, operand)
-                if source_val in emitter_map:
-                    instr.parent_edges.append(MSInstructionEdge(
-                        source=emitter_map[source_val], dest=instr, distance=distance
-                    ))
+            for operand_field in input_fields.values():
+                for operand in _iter_value_operands(operand_field):
+                    distance = 1 if operand in yielded_values else 0
+                    source_val = iter_arg_to_yield.get(operand, operand)
+                    if source_val in emitter_map:
+                        instr.parent_edges.append(MSInstructionEdge(
+                            source=emitter_map[source_val], dest=instr, distance=distance
+                        ))
 
         for instr in instructions.values():
             manager.add_instruction(instr)
 
-        prologue, steady_state, epilogue, ii_value, num_stages, stage_of = manager.solve(
+        (
+            prologue,
+            steady_state,
+            epilogue,
+            ii_value,
+            num_stages,
+            stage_of,
+            kernel_start,
+        ) = manager.solve(
             max_cycles=max_cycles,
             depth=depth,
             resource_counts=resource_counts,
@@ -230,20 +272,24 @@ def kernel_pass(kernel: Kernel) -> Kernel:
             new_body.append(op)
             continue
 
-        # ---- Build pipelined IR using buffer ops ----
-        #
-        # Shared memory is modelled as mutable buffer arrays, not SSA
-        # values.  The ForOp only carries the accumulator as an iter_arg;
-        # buffer indexing is expressed via BufSlotExpr.
-
-        pipeline_depth = num_stages - 1
         instr_to_op: Dict[str, Op] = {str(b): b for b in op.body}
-        load_ops = [b for b in op.body if isinstance(b, TMALoadOp)]
-        mma_ops = [b for b in op.body if isinstance(b, MMAOp)]
+        load_ops: List[TMALoadOp] = [b for b in op.body if isinstance(b, TMALoadOp)]
+        scheduled_names = sorted(
+            instructions.keys(),
+            key=lambda n: (kernel_start[n], instr_order[n]),
+        )
+
+        # ---- Build pipelined IR using buffer ops ----
+        pipeline_depth = num_stages - 1
+        if max_pipeline_depth is not None and pipeline_depth > max_pipeline_depth:
+            new_body.append(op)
+            continue
 
         # ---- ALLOC SHARED BUFFERS ----
         buf_values: Dict[Value, Value] = {}
         for ld in load_ops:
+            if not isinstance(ld.result.type, SharedTileType):
+                continue
             buf_type = SharedBufferType(
                 tile_type=ld.result.type,
                 count=num_stages,
@@ -261,33 +307,42 @@ def kernel_pass(kernel: Kernel) -> Kernel:
                 coords_op = source_op.substitute(
                     {op.induction_var: logical_iter}
                 )
+                coords = source_op.coords
+                if isinstance(coords_op, TMALoadOp):
+                    coords = coords_op.coords
                 new_body.append(TMALoadBufOp(
                     buf=buf_values[source_op.result],
                     slot=step_idx,
                     source=source_op.source,
-                    coords=coords_op.coords,
+                    coords=coords,
                 ))
 
         # ---- STEADY STATE LOOP ----
-        # Use steady_state[0] to determine loop body ops and ordering.
-        # All steady-state steps have the same instructions (just on
-        # different logical iterations), so step 0 is representative.
-
-        mma_stage = stage_of[str(mma_ops[0])]
-        compute_slot = BufSlotExpr(
-            value=op.induction_var,
-            offset=-mma_stage,
-            modulus=num_stages,
-        )
-
         body_ops: List[Op] = []
+        if load_ops:
+            first_consumer_stage = min(
+                stage_of[name]
+                for name in scheduled_names
+                for v in _iter_value_operands(vars(instr_to_op[name]))
+                if isinstance(instr_to_op[name], Op)
+                if v in buf_values
+            ) if any(
+                v in buf_values
+                for name in scheduled_names
+                for v in _iter_value_operands(vars(instr_to_op[name]))
+            ) else 0
 
-        body_ops.append(WaitBufOp(
-            bufs=tuple(buf_values[ld.result] for ld in load_ops),
-            slot=compute_slot,
-        ))
+            compute_slot = BufSlotExpr(
+                value=op.induction_var,
+                offset=-first_consumer_stage,
+                modulus=num_stages,
+            )
+            body_ops.append(WaitBufOp(
+                bufs=tuple(buf_values[ld.result] for ld in load_ops),
+                slot=compute_slot,
+            ))
 
-        for (inst_name, _buf_offset) in steady_state[0]:
+        for inst_name in scheduled_names:
             source_op = instr_to_op[inst_name]
             op_stage = stage_of[inst_name]
             slot = BufSlotExpr(
@@ -303,15 +358,20 @@ def kernel_pass(kernel: Kernel) -> Kernel:
                     source=source_op.source,
                     coords=source_op.coords,
                 ))
+            elif isinstance(source_op, WaitOp):
+                continue
             elif isinstance(source_op, MMAOp):
                 body_ops.append(MMABufOp(
                     result=source_op.result,
-                    a_buf=buf_values[source_op.a],
-                    a_slot=slot,
-                    b_buf=buf_values[source_op.b],
-                    b_slot=slot,
+                    a_buf=buf_values.get(source_op.a, source_op.a),
+                    a_slot=slot if source_op.a in buf_values else 0,
+                    b_buf=buf_values.get(source_op.b, source_op.b),
+                    b_slot=slot if source_op.b in buf_values else 0,
                     accum=source_op.accum,
+                    transpose_b=source_op.transpose_b,
                 ))
+            elif not isinstance(source_op, YieldOp):
+                body_ops.append(source_op)
 
         body_ops.append(yield_op)
 
@@ -328,32 +388,27 @@ def kernel_pass(kernel: Kernel) -> Kernel:
 
         # ---- EPILOGUE: drain remaining pipeline_depth compute steps ----
         for ep_step, ep_ops in enumerate(epilogue):
-            buf_list = tuple(buf_values[ld.result] for ld in load_ops)
-            drain_slot = BufSlotExpr(
-                value=None, offset=ep_step, modulus=num_stages,
-            )
-            new_body.append(WaitBufOp(bufs=buf_list, slot=drain_slot))
+            if load_ops:
+                buf_list = tuple(buf_values[ld.result] for ld in load_ops)
+                drain_slot = ep_step % num_stages
+                new_body.append(WaitBufOp(bufs=buf_list, slot=drain_slot))
             for (inst_name, _buf_offset) in ep_ops:
                 source_op = instr_to_op[inst_name]
+                drain_slot = ep_step % num_stages
+                if isinstance(source_op, (TMALoadOp, WaitOp, YieldOp)):
+                    continue
                 if isinstance(source_op, MMAOp):
-                    ep_result = Value(
-                        f"{source_op.result.name}_ep{ep_step}",
-                        source_op.result.type,
-                    )
-                    accum_result = op.results[
-                        next(
-                            j for j, ia in enumerate(op.iter_args)
-                            if ia.block_arg == source_op.accum
-                        )
-                    ]
                     new_body.append(MMABufOp(
-                        result=ep_result,
-                        a_buf=buf_values[source_op.a],
-                        a_slot=drain_slot,
-                        b_buf=buf_values[source_op.b],
-                        b_slot=drain_slot,
-                        accum=accum_result,
+                        result=source_op.result,
+                        a_buf=buf_values.get(source_op.a, source_op.a),
+                        a_slot=drain_slot if source_op.a in buf_values else 0,
+                        b_buf=buf_values.get(source_op.b, source_op.b),
+                        b_slot=drain_slot if source_op.b in buf_values else 0,
+                        accum=source_op.accum,
+                        transpose_b=source_op.transpose_b,
                     ))
+                else:
+                    new_body.append(source_op)
 
     return Kernel(name=kernel.name, inputs=kernel.inputs, outputs=kernel.outputs, body=tuple(new_body))
 

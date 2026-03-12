@@ -159,11 +159,12 @@ def _format_ops(ops: tuple[Op, ...], indent: int, lines: list[str]) -> None:
         elif isinstance(op, MMABufOp):
             a_idx = _format_buf_idx(op.a_slot)
             b_idx = _format_buf_idx(op.b_slot)
+            t_str = ", transpose_b=True" if op.transpose_b else ""
             lines.append(
                 f"{pad}{repr(op.result)} = mma_buf("
                 f"{op.a_buf.name}[{a_idx}], "
                 f"{op.b_buf.name}[{b_idx}], "
-                f"{repr(op.accum)})"
+                f"{repr(op.accum)}{t_str})"
             )
 
         elif isinstance(op, TMAStoreOp):

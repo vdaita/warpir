@@ -38,9 +38,12 @@ from warpir.ir import (
     YieldOp,
     ZeroOp,
 )
+from warpir.passes.modulo_scheduler import kernel_pass as pipeline_pass
 
 # D=64: 1/sqrt(64) * log2(e) for exp2-based softmax
 SCALE = 0.125 * 1.44269504089
+# Optional cap for modulo-scheduler pipeline depth. Set to >0 to enable.
+MAX_PIPELINE_DEPTH = int(os.environ.get("WARPIR_MAX_PIPELINE_DEPTH", "2"))
 
 
 def build_attention_kernel() -> Kernel:
@@ -208,3 +211,14 @@ if __name__ == "__main__":
     out_path = out_dir / "attention_baseline.cu"
     out_path.write_text(cuda_src)
     print(f"\nWrote {out_path}")
+
+    pipelined_kernel = pipeline_pass(
+        kernel,
+        max_pipeline_depth=(
+            MAX_PIPELINE_DEPTH if MAX_PIPELINE_DEPTH > 0 else None
+        ),
+    )
+    pipeline_lowerer = ThunderKittensLowerer()
+    cuda_src_pipelined = pipeline_lowerer.lower(pipelined_kernel)
+    print("=== Pipelined TK CUDA === ")
+    print(cuda_src_pipelined)

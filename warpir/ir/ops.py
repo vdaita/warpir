@@ -228,6 +228,7 @@ class MMABufOp(Op):
     b_buf: Value
     b_slot: BufIdx
     accum: Value
+    transpose_b: bool = False
 
 
 # ---------------------------------------------------------------------------
