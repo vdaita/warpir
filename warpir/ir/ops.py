@@ -231,6 +231,38 @@ class MMABufOp(Op):
 
 
 # ---------------------------------------------------------------------------
+# Warp specialization
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WarpSpecializedRegionOp(Op):
+    """Warp-specialized producer/consumer region.
+
+    Lowered to:
+      warpgroup 0 = producer (decrease_registers, TMA loads via full/empty protocol)
+      warpgroup 1+ = consumer (increase_registers, compute via full/empty protocol)
+    Both share a loop over the same iteration range.
+    """
+    num_stages: int
+    bufs: tuple[Value, ...]
+
+    induction_var: Value
+    start: Union[Value, int]
+    stop: Union[Value, int]
+    step: Union[Value, int]
+    tile_size: Union[int, None]
+
+    producer_body: tuple[Op, ...]
+    consumer_setup: tuple[Op, ...]
+    consumer_body: tuple[Op, ...]
+    consumer_iter_args: tuple['IterArg', ...]
+    consumer_results: tuple[Value, ...]
+    consumer_finish: tuple[Op, ...]
+
+    num_consumer_warpgroups: int = 1
+
+
+# ---------------------------------------------------------------------------
 # Control flow
 # ---------------------------------------------------------------------------
 

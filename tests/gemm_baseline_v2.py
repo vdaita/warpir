@@ -92,36 +92,45 @@ if __name__ == "__main__":
     from pathlib import Path
     from warpir.printing import print_kernel
     from warpir.lowering import ThunderKittensLowerer
-    from warpir.passes.modulo_scheduler import kernel_pass
+    from warpir.passes.modulo_scheduler import kernel_pass as pipeline_pass
+    from warpir.passes.warp_assigner import kernel_pass as warp_spec_pass
 
     kernel = build_gemm_kernel()
-    pipelined_kernel = kernel_pass(kernel)
+    pipelined_kernel = pipeline_pass(kernel)
+    warp_spec_kernel = warp_spec_pass(kernel)
 
     print("=== IR ===")
     print_kernel(kernel)
     print()
-    
+
     print("=== Pipelined kernel IR ===")
     print_kernel(pipelined_kernel)
     print()
 
+    print("=== Warp-specialized kernel IR ===")
+    print_kernel(warp_spec_kernel)
+    print()
+
     lowerer = ThunderKittensLowerer()
     cuda_src = lowerer.lower(kernel)
-
     print("=== ThunderKittens CUDA ===")
     print(cuda_src)
-    
+
     pipeline_lowerer = ThunderKittensLowerer()
     cuda_src_pipelined = pipeline_lowerer.lower(pipelined_kernel)
     print("=== Pipelined TK CUDA === ")
     print(cuda_src_pipelined)
-    
-    out_path = Path(__file__).parent / "outputs" / "gemm_baseline.cu"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(cuda_src)
-    print(f"Wrote {out_path}")
-    
-    out_path_pipelined = Path(__file__).parent / "outputs" / "gemm_baseline_pipelined.cu"
-    out_path_pipelined.write_text(cuda_src_pipelined)
-    
-    print(f"Wrote {out_path_pipelined}")
+
+    ws_lowerer = ThunderKittensLowerer()
+    cuda_src_ws = ws_lowerer.lower(warp_spec_kernel)
+    print("=== Warp-specialized TK CUDA ===")
+    print(cuda_src_ws)
+
+    out_dir = Path(__file__).parent / "outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    (out_dir / "gemm_baseline.cu").write_text(cuda_src)
+    (out_dir / "gemm_baseline_pipelined.cu").write_text(cuda_src_pipelined)
+    (out_dir / "gemm_warp_specialized.cu").write_text(cuda_src_ws)
+
+    print(f"Wrote outputs to {out_dir}")

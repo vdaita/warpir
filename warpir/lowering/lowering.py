@@ -25,6 +25,7 @@ from warpir.ir.ops import (
     Value,
     WaitBufOp,
     WaitOp,
+    WarpSpecializedRegionOp,
     YieldOp,
     ZeroOp,
 )
@@ -59,6 +60,7 @@ class ThunderKittensLowerer:
         self._load_to_sem: dict[str, str] = {}
         self._buf_allocations: dict[str, SharedBufferType] = {}
         self._buf_num_stages: int = 0
+        self._has_warp_specialized: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -86,18 +88,30 @@ class ThunderKittensLowerer:
 
     def _build_aliases(self, ops: tuple[Op, ...]) -> None:
         for op in ops:
-            if not isinstance(op, ForOp):
-                continue
-            for i, ia in enumerate(op.iter_args):
-                self._aliases[ia.init.name] = ia.block_arg.name
-                if i < len(op.results):
-                    self._aliases[op.results[i].name] = ia.block_arg.name
-            for body_op in op.body:
-                if isinstance(body_op, YieldOp):
-                    for i, yv in enumerate(body_op.values):
-                        if i < len(op.iter_args):
-                            self._aliases[yv.name] = op.iter_args[i].block_arg.name
-            self._build_aliases(op.body)
+            if isinstance(op, ForOp):
+                for i, ia in enumerate(op.iter_args):
+                    self._aliases[ia.init.name] = ia.block_arg.name
+                    if i < len(op.results):
+                        self._aliases[op.results[i].name] = ia.block_arg.name
+                for body_op in op.body:
+                    if isinstance(body_op, YieldOp):
+                        for i, yv in enumerate(body_op.values):
+                            if i < len(op.iter_args):
+                                self._aliases[yv.name] = op.iter_args[i].block_arg.name
+                self._build_aliases(op.body)
+            elif isinstance(op, WarpSpecializedRegionOp):
+                for i, ia in enumerate(op.consumer_iter_args):
+                    self._aliases[ia.init.name] = ia.block_arg.name
+                    if i < len(op.consumer_results):
+                        self._aliases[op.consumer_results[i].name] = ia.block_arg.name
+                for body_op in op.consumer_body:
+                    if isinstance(body_op, YieldOp):
+                        for i, yv in enumerate(body_op.values):
+                            if i < len(op.consumer_iter_args):
+                                self._aliases[yv.name] = op.consumer_iter_args[i].block_arg.name
+                self._build_aliases(op.consumer_body)
+                self._build_aliases(op.consumer_setup)
+                self._build_aliases(op.consumer_finish)
 
     def _resolve(self, name: str) -> str:
         visited: set[str] = set()
@@ -142,6 +156,8 @@ class ThunderKittensLowerer:
                     self._buf_num_stages = max(
                         self._buf_num_stages, op.result.type.count,
                     )
+            elif isinstance(op, WarpSpecializedRegionOp):
+                self._has_warp_specialized = True
             elif isinstance(op, ForOp):
                 self._analyze_buffer_ops(op.body)
 
@@ -237,6 +253,9 @@ class ThunderKittensLowerer:
             for op in ops:
                 if isinstance(op, (AllocSharedOp, TMALoadBufOp)):
                     continue
+                if isinstance(op, WarpSpecializedRegionOp):
+                    try_decl(op.induction_var.name, op.induction_var.type)
+                    continue
                 if hasattr(op, 'result') and isinstance(getattr(op, 'result'), Value):
                     is_shared = isinstance(op, TMALoadOp)
                     try_decl(op.result.name, op.result.type, shared=is_shared)
@@ -246,7 +265,7 @@ class ThunderKittensLowerer:
 
         walk(kernel.body)
 
-        if self._buf_allocations:
+        if self._buf_allocations and not self._has_warp_specialized:
             decls.append("int _compute_buf = 0;")
 
         return decls
@@ -261,7 +280,7 @@ class ThunderKittensLowerer:
             lines.append(f"  init_semaphore({sem}, 0, 1);")
             lines.append(f"}}")
         n = self._buf_num_stages
-        if n:
+        if n and not self._has_warp_specialized:
             tic_init = ", ".join(["0"] * n)
             lines.append(f"__shared__ semaphore sem_pipe[{n}];")
             lines.append(f"int tic[{n}] = {{{tic_init}}};")
@@ -316,7 +335,10 @@ class ThunderKittensLowerer:
         lines: list[str] = []
         i = 0
         while i < len(ops):
-            if isinstance(ops[i], TMALoadOp):
+            if isinstance(ops[i], WarpSpecializedRegionOp):
+                lines.extend(self._lower_warp_specialized(ops[i], depth))  # type: ignore[arg-type]
+                i += 1
+            elif isinstance(ops[i], TMALoadOp):
                 batch: list[TMALoadOp] = []
                 while i < len(ops) and isinstance(ops[i], TMALoadOp):
                     batch.append(ops[i])  # type: ignore[arg-type]
@@ -603,4 +625,162 @@ class ThunderKittensLowerer:
         lines = [f"{pad}for ({iv} = {start}; {iv} < {stop}; {iv} += {step}) {{"]
         lines.extend(self._lower_ops(op.body, depth + 1))
         lines.append(f"{pad}}}")
+        return lines
+
+    # ------------------------------------------------------------------
+    # Warp-specialized lowering (producer/consumer with full/empty sems)
+    # ------------------------------------------------------------------
+
+    def _ws_stop_expr(self, op: WarpSpecializedRegionOp) -> str:
+        if op.tile_size is not None:
+            stop_val = (
+                self._val_name(op.stop) if isinstance(op.stop, Value) else str(op.stop)
+            )
+            return f"(({stop_val} + {op.tile_size - 1}) / {op.tile_size})"
+        return self._val_name(op.stop) if isinstance(op.stop, Value) else str(op.stop)
+
+    def _ws_consumer_decls(self, op: WarpSpecializedRegionOp) -> list[str]:
+        """Collect register-tile / col-vec declarations for the consumer branch."""
+        decls: list[str] = []
+        declared: set[str] = set()
+
+        def try_decl(name: str, typ: TypeRef) -> None:
+            resolved = self._resolve(name)
+            if resolved in declared or resolved in self._globals or resolved in self.BUILTINS:
+                return
+            declared.add(resolved)
+            decls.append(f"{self._render_tk_type(typ)} {resolved};")
+
+        for ia in op.consumer_iter_args:
+            try_decl(ia.block_arg.name, ia.block_arg.type)
+
+        all_ops = list(op.consumer_setup) + list(op.consumer_body) + list(op.consumer_finish)
+        for cop in all_ops:
+            if isinstance(cop, (AllocSharedOp, TMALoadBufOp)):
+                continue
+            if hasattr(cop, 'result') and isinstance(getattr(cop, 'result'), Value):
+                try_decl(cop.result.name, cop.result.type)
+
+        return decls
+
+    def _lower_warp_specialized(
+        self, op: WarpSpecializedRegionOp, depth: int
+    ) -> list[str]:
+        pad = "  " * depth
+        p1 = "  " * (depth + 1)
+        ns = op.num_stages
+        iv = self._resolve(op.induction_var.name)
+        stop = self._ws_stop_expr(op)
+
+        lines: list[str] = []
+        lines.append(f"{pad}const int warpid = kittens::warpid();")
+        lines.append(f"{pad}const int warpgroupid = warpid / 4;")
+        lines.append("")
+
+        # ── Full/empty semaphore init ─────────────────────────────────
+        nc = op.num_consumer_warpgroups
+        lines.append(f"{pad}__shared__ semaphore full[{ns}], empty[{ns}];")
+        lines.append(f"{pad}if (threadIdx.x == 0) {{")
+        lines.append(f"{p1}for (int _i = 0; _i < {ns}; _i++) {{")
+        lines.append(f"{p1}  init_semaphore(full[_i], 0, 1);")
+        lines.append(f"{p1}  init_semaphore(empty[_i], {nc}, 0);")
+        lines.append(f"{p1}}}")
+        lines.append(f"{pad}}}")
+        lines.append(f"{pad}__syncthreads();")
+        lines.append("")
+
+        # ── Producer branch ───────────────────────────────────────────
+        lines.append(f"{pad}if (warpgroupid == 0) {{ // producer")
+        lines.extend(self._ws_lower_producer(op, depth + 1, iv, stop))
+
+        # ── Consumer branch ───────────────────────────────────────────
+        lines.append(f"{pad}}} else {{ // consumer")
+        lines.extend(self._ws_lower_consumer(op, depth + 1, iv, stop))
+        lines.append(f"{pad}}}")
+        return lines
+
+    def _ws_lower_producer(
+        self, op: WarpSpecializedRegionOp, depth: int, iv: str, stop: str
+    ) -> list[str]:
+        pad = "  " * depth
+        p1 = "  " * (depth + 1)
+        p2 = "  " * (depth + 2)
+        ns = op.num_stages
+
+        lines: list[str] = []
+        lines.append(f"{pad}warpgroup::decrease_registers<32>();")
+        lines.append(f"{pad}if (warpgroup::laneid() == 0) {{")
+        lines.append(f"{p1}int _p = 0, _qidx = 0;")
+        lines.append(f"{p1}for ({iv} = 0; {iv} < {stop}; {iv} += 1, _qidx++) {{")
+        lines.append(f"{p2}if (_qidx == {ns}) {{ _qidx = 0; _p ^= 1; }}")
+        lines.append(f"{p2}wait(empty[_qidx], _p);")
+
+        # Group all TMALoadBufOps — they share the same full[_qidx] semaphore
+        load_ops = [o for o in op.producer_body if isinstance(o, TMALoadBufOp)]
+        if load_ops:
+            expect_parts = [f"size_bytes<typeof({ld.buf.name}[0])>" for ld in load_ops]
+            lines.append(f"{p2}tma::expect_bytes(full[_qidx], {' + '.join(expect_parts)});")
+            for ld in load_ops:
+                source = self._val_name(ld.source)
+                coords = self._render_coords(ld.coords)
+                lines.append(
+                    f"{p2}tma::load_async("
+                    f"{ld.buf.name}[_qidx], {source}, {coords}, full[_qidx]);"
+                )
+
+        lines.append(f"{p1}}}")  # end for
+        lines.append(f"{pad}}}")  # end laneid
+        return lines
+
+    def _ws_lower_consumer(
+        self, op: WarpSpecializedRegionOp, depth: int, iv: str, stop: str
+    ) -> list[str]:
+        pad = "  " * depth
+        p1 = "  " * (depth + 1)
+        p2 = "  " * (depth + 2)
+        ns = op.num_stages
+
+        lines: list[str] = []
+        lines.append(f"{pad}warpgroup::increase_registers<256>();")
+
+        # Consumer-local register declarations
+        for d in self._ws_consumer_decls(op):
+            lines.append(f"{pad}{d}")
+
+        # Consumer setup (zero accumulators, etc.)
+        for setup_op in op.consumer_setup:
+            lines.extend(self._lower_op(setup_op, depth))
+        lines.append("")
+
+        # Kickstart producer by signalling empty semaphores
+        lines.append(f"{pad}if (warpgroup::laneid() == 0)")
+        lines.append(f"{p1}for (int _i = 0; _i < {ns}; _i++) arrive(empty[_i], 1);")
+        lines.append("")
+
+        # Consumer loop
+        lines.append(f"{pad}int _p = 0, _qidx = 0;")
+        lines.append(f"{pad}for ({iv} = 0; {iv} < {stop}; {iv} += 1, _qidx++) {{")
+        lines.append(f"{p1}if (_qidx == {ns}) {{ _qidx = 0; _p ^= 1; }}")
+        lines.append(f"{p1}wait(full[_qidx], _p);")
+
+        for body_op in op.consumer_body:
+            if isinstance(body_op, MMABufOp):
+                accum = self._val_name(body_op.accum)
+                a_buf = body_op.a_buf.name
+                b_buf = body_op.b_buf.name
+                lines.append(f"{p1}warpgroup::mma_AB({accum}, {a_buf}[_qidx], {b_buf}[_qidx]);")
+                lines.append(f"{p1}warpgroup::mma_async_wait();")
+            elif isinstance(body_op, YieldOp):
+                pass
+            else:
+                lines.extend(self._lower_op(body_op, depth + 1))
+
+        lines.append(f"{p1}if (warpgroup::laneid() == 0) arrive(empty[_qidx], 1);")
+        lines.append(f"{pad}}}")  # end for
+        lines.append("")
+
+        # Post-loop (store, etc.)
+        for finish_op in op.consumer_finish:
+            lines.extend(self._lower_op(finish_op, depth))
+
         return lines

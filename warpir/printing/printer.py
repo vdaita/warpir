@@ -25,6 +25,7 @@ from warpir.ir.ops import (
     Value,
     WaitBufOp,
     WaitOp,
+    WarpSpecializedRegionOp,
     YieldOp,
     ZeroOp,
 )
@@ -174,6 +175,37 @@ def _format_ops(ops: tuple[Op, ...], indent: int, lines: list[str]) -> None:
         elif isinstance(op, YieldOp):
             vals = ", ".join(repr(v) for v in op.values)
             lines.append(f"{pad}yield({vals})")
+
+        elif isinstance(op, WarpSpecializedRegionOp):
+            bufs_str = ", ".join(v.name for v in op.bufs)
+            iter_args_str = ", ".join(
+                f"{repr(ia.block_arg)} = {repr(ia.init)}"
+                for ia in op.consumer_iter_args
+            )
+            results_str = ", ".join(repr(r) for r in op.consumer_results)
+            tile_str = f" tile_size={op.tile_size}" if op.tile_size else ""
+            lines.append(
+                f"{pad}({results_str}) = warp_specialized("
+                f"stages={op.num_stages}, bufs=[{bufs_str}])"
+            )
+            lines.append(
+                f"{pad}  for {repr(op.induction_var)} = {op.start} to "
+                f"{op.stop} step {op.step}{tile_str}"
+            )
+            lines.append(f"{pad}  consumer_iter_args({iter_args_str}) {{")
+            lines.append(f"{pad}  producer {{")
+            _format_ops(op.producer_body, indent + 3, lines)
+            lines.append(f"{pad}  }}")
+            lines.append(f"{pad}  consumer_setup {{")
+            _format_ops(op.consumer_setup, indent + 3, lines)
+            lines.append(f"{pad}  }}")
+            lines.append(f"{pad}  consumer_body {{")
+            _format_ops(op.consumer_body, indent + 3, lines)
+            lines.append(f"{pad}  }}")
+            lines.append(f"{pad}  consumer_finish {{")
+            _format_ops(op.consumer_finish, indent + 3, lines)
+            lines.append(f"{pad}  }}")
+            lines.append(f"{pad}}}")
 
         elif isinstance(op, ForOp):
             iter_args_str = ", ".join(

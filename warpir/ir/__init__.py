@@ -25,6 +25,7 @@ from .ops import (
     Value,
     WaitBufOp,
     WaitOp,
+    WarpSpecializedRegionOp,
     YieldOp,
     ZeroOp,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "Value",
     "WaitBufOp",
     "WaitOp",
+    "WarpSpecializedRegionOp",
     "YieldOp",
     "ZeroOp",
     "ColVecType",

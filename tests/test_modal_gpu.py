@@ -1,4 +1,4 @@
-"""Test WarpIR GEMM kernels (baseline + pipelined) on an H100 via Modal.
+"""Test WarpIR GEMM kernels (baseline + pipelined + warp-specialized) on an H100 via Modal.
 
 Usage:
     uv run modal run tests/test_modal_gpu.py
@@ -7,6 +7,7 @@ import modal
 
 BLOCK_SIZE = 64
 NUM_THREADS = 128
+NUM_THREADS_WS = 256  # 2 warpgroups: 1 producer + 1 consumer
 
 EXTRA_CUDA_CFLAGS = [
     "-std=c++20", "-O3", "--use_fast_math",
@@ -46,6 +47,21 @@ void launch_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
     unsigned long mem_size = 100000;
     cudaFuncSetAttribute(gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
     gemm<<<grid, {NUM_THREADS}, mem_size>>>(g);
+}}
+"""
+
+LAUNCH_WRAPPER_WARP_SPEC = f"""
+void launch_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C) {{
+    size_t N = A.size(0);
+    using tile_gl = gl<bf16, 1, 1, -1, -1, st_bf<{BLOCK_SIZE}, {BLOCK_SIZE}>>;
+    tile_gl a_gl{{(bf16*)A.data_ptr(), nullptr, nullptr, N, N}};
+    tile_gl b_gl{{(bf16*)B.data_ptr(), nullptr, nullptr, N, N}};
+    tile_gl c_gl{{(bf16*)C.data_ptr(), nullptr, nullptr, N, N}};
+    global_vars g{{a_gl, b_gl, (int)N, c_gl}};
+    dim3 grid(N / {BLOCK_SIZE}, N / {BLOCK_SIZE});
+    unsigned long mem_size = 100000;
+    cudaFuncSetAttribute(gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    gemm<<<grid, {NUM_THREADS_WS}, mem_size>>>(g);
 }}
 """
 
@@ -159,15 +175,18 @@ def test_gemm():
 
     from tests.gemm_baseline_v2 import build_gemm_kernel
     from warpir.lowering import ThunderKittensLowerer
-    from warpir.passes.modulo_scheduler import kernel_pass
+    from warpir.passes.modulo_scheduler import kernel_pass as pipeline_pass
+    from warpir.passes.warp_assigner import kernel_pass as warp_spec_pass
 
     # ---- Build IR ----
     kernel = build_gemm_kernel()
-    pipelined_kernel = kernel_pass(kernel)
+    pipelined_kernel = pipeline_pass(kernel)
+    warp_spec_kernel = warp_spec_pass(kernel)
 
     # ---- Lower to CUDA ----
     baseline_cuda = ThunderKittensLowerer().lower(kernel)
     pipelined_cuda = ThunderKittensLowerer().lower(pipelined_kernel)
+    warp_spec_cuda = ThunderKittensLowerer().lower(warp_spec_kernel)
 
     print("=== Baseline CUDA ===")
     print(baseline_cuda)
@@ -175,16 +194,21 @@ def test_gemm():
     print("=== Pipelined CUDA ===")
     print(pipelined_cuda)
     print()
+    print("=== Warp-specialized CUDA ===")
+    print(warp_spec_cuda)
+    print()
 
     # ---- Compile ----
     baseline_mod = _compile("gemm_baseline", baseline_cuda, LAUNCH_WRAPPER_BASELINE)
     pipelined_mod = _compile("gemm_pipelined", pipelined_cuda, LAUNCH_WRAPPER_PIPELINED)
+    warp_spec_mod = _compile("gemm_warp_spec", warp_spec_cuda, LAUNCH_WRAPPER_WARP_SPEC)
 
     # ---- Correctness ----
     test_sizes = [128, 256, 512, 1024]
     print("=== Correctness ===")
     ok_baseline = _test_correctness(baseline_mod, "baseline", test_sizes)
     ok_pipelined = _test_correctness(pipelined_mod, "pipelined", test_sizes)
+    ok_warp_spec = _test_correctness(warp_spec_mod, "warp_spec", test_sizes)
 
     # ---- Benchmark ----
     bench_sizes = [256, 512, 1024, 2048, 4096]
@@ -193,10 +217,11 @@ def test_gemm():
     for N in bench_sizes:
         _benchmark(baseline_mod, "baseline", N)
         _benchmark(pipelined_mod, "pipelined", N)
+        _benchmark(warp_spec_mod, "warp_spec", N)
         print()
 
     # ---- Summary ----
-    all_passed = ok_baseline and ok_pipelined
+    all_passed = ok_baseline and ok_pipelined and ok_warp_spec
     print("PASSED" if all_passed else "FAILED")
     return all_passed
 

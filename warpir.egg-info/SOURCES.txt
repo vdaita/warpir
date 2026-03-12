@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 tests/test_gemm_baseline.py
+tests/test_modal_attention.py
 tests/test_modal_gpu.py
 warpir/__init__.py
 warpir.egg-info/PKG-INFO
