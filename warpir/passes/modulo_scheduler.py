@@ -48,7 +48,14 @@ class MSInstructionManager:
         for parent_edge in instruction.parent_edges:
             self.child_edges[parent_edge.source.name] = self.child_edges.get(parent_edge.source.name, []) + [parent_edge]
 
-    def solve(self, max_cycles: int, depth: int, resource_counts: Dict[str, int], use_verbose=False):
+    def solve(
+        self,
+        max_cycles: int,
+        depth: int,
+        resource_counts: Dict[str, int],
+        use_verbose: bool = False,
+        max_pipeline_depth: Union[int, None] = None,
+    ):
         model = cp_model.CpModel()
         
         
@@ -93,6 +100,13 @@ class MSInstructionManager:
                     self.intervals[(i + 1, instruction.name)].start_expr() ==
                     self.intervals[(i, instruction.name)].start_expr() + ii # type: ignore
                 ) 
+
+        if max_pipeline_depth is not None:
+            for instruction in self.instructions:
+                model.add(
+                    self.intervals[(0, instruction.name)].start_expr() <=
+                    max_pipeline_depth * ii  # type: ignore
+                )
                     
                     
         makespan = model.new_int_var(0, max_cycles - 1, "makespan")
@@ -124,14 +138,12 @@ class MSInstructionManager:
                 instruction.name: solver.value(self.intervals[(0, instruction.name)].start_expr()) # type: ignore
                 for instruction in self.instructions
             }
+            base_start = min(kernel_start.values()) if kernel_start else 0
             stage_of: Dict[str, int] = {
-                instruction.name: kernel_start[instruction.name] // ii_value
+                instruction.name: (kernel_start[instruction.name] - base_start) // ii_value
                 for instruction in self.instructions
             }
-            num_stages = max(
-                solver.value(self.intervals[(0, instruction.name)].start_expr()) // ii_value # type: ignore
-                for instruction in self.instructions
-            ) + 1
+            num_stages = max(stage_of.values()) + 1
             
             # prologue: list of steps, each step is list of (logical_iter, inst_name)
             prologue = []
@@ -195,8 +207,12 @@ def _op_schedule_info(op: Op) -> Union[Tuple[str, int], None]:
 def kernel_pass(kernel: Kernel, max_pipeline_depth: Union[int, None] = None) -> Kernel:
     resource_counts = {"tma": 4, "tc": 1, "cuda": 1}
     max_cycles = 5000
-    depth = 10
+    default_depth = 10
     use_verbose = False
+
+    solve_depth = default_depth
+    if max_pipeline_depth is not None:
+        solve_depth = max(2, max_pipeline_depth + 1)
 
     new_body = []
     for op in kernel.body:
@@ -263,9 +279,10 @@ def kernel_pass(kernel: Kernel, max_pipeline_depth: Union[int, None] = None) -> 
             kernel_start,
         ) = manager.solve(
             max_cycles=max_cycles,
-            depth=depth,
+            depth=solve_depth,
             resource_counts=resource_counts,
             use_verbose=use_verbose,
+            max_pipeline_depth=max_pipeline_depth,
         )
 
         if prologue is None:
@@ -281,9 +298,6 @@ def kernel_pass(kernel: Kernel, max_pipeline_depth: Union[int, None] = None) -> 
 
         # ---- Build pipelined IR using buffer ops ----
         pipeline_depth = num_stages - 1
-        if max_pipeline_depth is not None and pipeline_depth > max_pipeline_depth:
-            new_body.append(op)
-            continue
 
         # ---- ALLOC SHARED BUFFERS ----
         buf_values: Dict[Value, Value] = {}
