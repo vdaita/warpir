@@ -3,11 +3,22 @@ from __future__ import annotations
 from warpir.ir.ops import (
     AllocSharedOp,
     BufSlotExpr,
+    CopyOp,
+    DivRowOp,
+    Exp2Op,
     ForOp,
     Kernel,
     MMABufOp,
     MMAOp,
+    MulOp,
+    MulRowOp,
+    MulScalarOp,
+    NegInftyOp,
     Op,
+    RowMaxOp,
+    RowSumOp,
+    SubOp,
+    SubRowOp,
     TMALoadBufOp,
     TMALoadOp,
     TMAStoreOp,
@@ -18,6 +29,7 @@ from warpir.ir.ops import (
     ZeroOp,
 )
 from warpir.ir.types import (
+    ColVecType,
     GPUType,
     GlobalType,
     IntType,
@@ -157,6 +169,10 @@ class ThunderKittensLowerer:
             sub = self._render_tk_type(t.sub_tile_type)
             return f"gl<{t.data_type.value}, {t.batch}, {t.depth}, {t.rows}, {t.cols}, {sub}>"
 
+        if isinstance(t, ColVecType):
+            prefix = "rt_bf" if t.data_type == GPUType.bf16 else "rt_fl"
+            return f"col_vec<{prefix}<{t.rows}, {t.cols}>>"
+
         if isinstance(t, IntType):
             return "int"
 
@@ -219,15 +235,14 @@ class ThunderKittensLowerer:
 
         def walk(ops: tuple[Op, ...]) -> None:
             for op in ops:
-                if isinstance(op, ZeroOp):
-                    try_decl(op.result.name, op.result.type)
-                elif isinstance(op, TMALoadOp):
-                    try_decl(op.result.name, op.result.type, shared=True)
-                elif isinstance(op, ForOp):
+                if isinstance(op, (AllocSharedOp, TMALoadBufOp)):
+                    continue
+                if hasattr(op, 'result') and isinstance(getattr(op, 'result'), Value):
+                    is_shared = isinstance(op, TMALoadOp)
+                    try_decl(op.result.name, op.result.type, shared=is_shared)
+                if isinstance(op, ForOp):
                     try_decl(op.induction_var.name, op.induction_var.type)
                     walk(op.body)
-                elif isinstance(op, (AllocSharedOp, TMALoadBufOp)):
-                    pass
 
         walk(kernel.body)
 
@@ -415,6 +430,9 @@ class ThunderKittensLowerer:
         if isinstance(op, ZeroOp):
             return [f"{pad}kittens::warp::zero({self._val_name(op.result)});"]
 
+        if isinstance(op, NegInftyOp):
+            return [f"{pad}kittens::warp::neg_infty({self._val_name(op.result)});"]
+
         if isinstance(op, WaitOp):
             group_key = frozenset(self._resolve(v.name) for v in op.values)
             sem = self._wait_group_sems[group_key]
@@ -434,14 +452,22 @@ class ThunderKittensLowerer:
             ]
 
         if isinstance(op, MMAOp):
+            result = self._val_name(op.result)
             accum = self._val_name(op.accum)
             a = self._val_name(op.a)
             b = self._val_name(op.b)
-            return [
-                f"{pad}warpgroup::mma_AB({accum}, {a}, {b});",
-                f"{pad}warpgroup::mma_async_wait();",
-                f"{pad}__syncthreads();",
-            ]
+            lines: list[str] = []
+            if op.transpose_b:
+                lines.append(f"{pad}warpgroup::mm_ABt({result}, {a}, {b});")
+            else:
+                if result != accum:
+                    lines.append(
+                        f"{pad}kittens::warp::copy({result}, {accum});"
+                    )
+                lines.append(f"{pad}warpgroup::mma_AB({result}, {a}, {b});")
+            lines.append(f"{pad}warpgroup::mma_async_wait();")
+            lines.append(f"{pad}__syncthreads();")
+            return lines
 
         if isinstance(op, MMABufOp):
             accum = self._val_name(op.accum)
@@ -460,6 +486,74 @@ class ThunderKittensLowerer:
                     f"{pad}_compute_buf = (_compute_buf + 1) % {mod};"
                 )
             return lines
+
+        if isinstance(op, CopyOp):
+            return [
+                f"{pad}kittens::warp::copy("
+                f"{self._val_name(op.result)}, {self._val_name(op.input)});"
+            ]
+
+        if isinstance(op, MulScalarOp):
+            return [
+                f"{pad}kittens::warp::mul("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.input)}, {op.scalar}f);"
+            ]
+
+        if isinstance(op, SubOp):
+            return [
+                f"{pad}kittens::warp::sub("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.a)}, {self._val_name(op.b)});"
+            ]
+
+        if isinstance(op, MulOp):
+            return [
+                f"{pad}kittens::warp::mul("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.a)}, {self._val_name(op.b)});"
+            ]
+
+        if isinstance(op, Exp2Op):
+            return [
+                f"{pad}kittens::warp::exp2("
+                f"{self._val_name(op.result)}, {self._val_name(op.input)});"
+            ]
+
+        if isinstance(op, RowMaxOp):
+            return [
+                f"{pad}kittens::warp::row_max("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.tile)}, {self._val_name(op.prev)});"
+            ]
+
+        if isinstance(op, RowSumOp):
+            return [
+                f"{pad}kittens::warp::row_sum("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.tile)}, {self._val_name(op.prev)});"
+            ]
+
+        if isinstance(op, SubRowOp):
+            return [
+                f"{pad}kittens::warp::sub_row("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.tile)}, {self._val_name(op.vec)});"
+            ]
+
+        if isinstance(op, MulRowOp):
+            return [
+                f"{pad}kittens::warp::mul_row("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.tile)}, {self._val_name(op.vec)});"
+            ]
+
+        if isinstance(op, DivRowOp):
+            return [
+                f"{pad}kittens::warp::div_row("
+                f"{self._val_name(op.result)}, "
+                f"{self._val_name(op.tile)}, {self._val_name(op.vec)});"
+            ]
 
         if isinstance(op, TMAStoreOp):
             source = self._val_name(op.source)

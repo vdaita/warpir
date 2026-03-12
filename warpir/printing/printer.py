@@ -3,11 +3,22 @@ from __future__ import annotations
 from warpir.ir.ops import (
     AllocSharedOp,
     BufSlotExpr,
+    CopyOp,
+    DivRowOp,
+    Exp2Op,
     ForOp,
     Kernel,
     MMABufOp,
     MMAOp,
+    MulOp,
+    MulRowOp,
+    MulScalarOp,
+    NegInftyOp,
     Op,
+    RowMaxOp,
+    RowSumOp,
+    SubOp,
+    SubRowOp,
     TMALoadBufOp,
     TMALoadOp,
     TMAStoreOp,
@@ -86,8 +97,62 @@ def _format_ops(ops: tuple[Op, ...], indent: int, lines: list[str]) -> None:
             lines.append(f"{pad}wait_buf({bufs}, slot={slot_str})")
 
         elif isinstance(op, MMAOp):
+            t_str = ", transpose_b=True" if op.transpose_b else ""
             lines.append(
-                f"{pad}{repr(op.result)} = mma({repr(op.a)}, {repr(op.b)}, {repr(op.accum)})"
+                f"{pad}{repr(op.result)} = mma({repr(op.a)}, {repr(op.b)}, {repr(op.accum)}{t_str})"
+            )
+
+        elif isinstance(op, NegInftyOp):
+            lines.append(f"{pad}{repr(op.result)} = neg_infty")
+
+        elif isinstance(op, CopyOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = copy({repr(op.input)})"
+            )
+
+        elif isinstance(op, MulScalarOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = mul_scalar({repr(op.input)}, {op.scalar})"
+            )
+
+        elif isinstance(op, SubOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = sub({repr(op.a)}, {repr(op.b)})"
+            )
+
+        elif isinstance(op, MulOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = mul({repr(op.a)}, {repr(op.b)})"
+            )
+
+        elif isinstance(op, Exp2Op):
+            lines.append(
+                f"{pad}{repr(op.result)} = exp2({repr(op.input)})"
+            )
+
+        elif isinstance(op, RowMaxOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = row_max({repr(op.tile)}, {repr(op.prev)})"
+            )
+
+        elif isinstance(op, RowSumOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = row_sum({repr(op.tile)}, {repr(op.prev)})"
+            )
+
+        elif isinstance(op, SubRowOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = sub_row({repr(op.tile)}, {repr(op.vec)})"
+            )
+
+        elif isinstance(op, MulRowOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = mul_row({repr(op.tile)}, {repr(op.vec)})"
+            )
+
+        elif isinstance(op, DivRowOp):
+            lines.append(
+                f"{pad}{repr(op.result)} = div_row({repr(op.tile)}, {repr(op.vec)})"
             )
 
         elif isinstance(op, MMABufOp):

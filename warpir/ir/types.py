@@ -61,6 +61,17 @@ class SharedBufferType:
 
 
 @dataclass(frozen=True)
+class ColVecType:
+    """Register column vector — col_vec<rt<data_type, rows, cols>>."""
+    data_type: GPUType
+    rows: int
+    cols: int
+
+    def __str__(self) -> str:
+        return f"col_vec<{self.data_type.value}, {self.rows}x{self.cols}>"
+
+
+@dataclass(frozen=True)
 class ScalarType:
     name: str
 
@@ -73,4 +84,4 @@ class IntType(ScalarType):
         super().__init__("int")
 
 
-TypeRef = Union[GlobalType, IntType, SharedTileType, RegTileType, SharedBufferType]
+TypeRef = Union[GlobalType, IntType, SharedTileType, RegTileType, SharedBufferType, ColVecType]

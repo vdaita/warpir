@@ -76,11 +76,16 @@ class WaitOp(Op):
 
 @dataclass(frozen=True)
 class MMAOp(Op):
-    """Matrix multiply-accumulate: result = a @ b + accum."""
+    """Matrix multiply-accumulate.
+
+    transpose_b=False:  result = a @ b + accum   (warpgroup::mma_AB)
+    transpose_b=True:   result = a @ b^T          (warpgroup::mm_ABt, non-accumulating)
+    """
     result: Value
     a: Value
     b: Value
     accum: Value
+    transpose_b: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,100 @@ class TMAStoreOp(Op):
     source: Value
     dest: Value
     coords: tuple[Union[Value, int], ...]
+
+
+# ---------------------------------------------------------------------------
+# Element-wise / reduction operations (register tiles & column vectors)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class NegInftyOp(Op):
+    """Initialize a register tile or column vector to negative infinity."""
+    result: Value
+
+
+@dataclass(frozen=True)
+class CopyOp(Op):
+    """Copy / type-cast (e.g. rt_fl → rt_bf, or col_vec copy)."""
+    result: Value
+    input: Value
+
+
+@dataclass(frozen=True)
+class MulScalarOp(Op):
+    """Multiply every element by a compile-time constant: result = input * scalar."""
+    result: Value
+    input: Value
+    scalar: float
+
+
+@dataclass(frozen=True)
+class SubOp(Op):
+    """Element-wise subtract: result = a - b."""
+    result: Value
+    a: Value
+    b: Value
+
+
+@dataclass(frozen=True)
+class MulOp(Op):
+    """Element-wise multiply: result = a * b."""
+    result: Value
+    a: Value
+    b: Value
+
+
+@dataclass(frozen=True)
+class Exp2Op(Op):
+    """Element-wise base-2 exponential: result = 2^input."""
+    result: Value
+    input: Value
+
+
+@dataclass(frozen=True)
+class RowMaxOp(Op):
+    """Row-wise max, accumulated with a previous column vector.
+
+    result[r] = max(max_over_cols(tile[r, :]), prev[r])
+    """
+    result: Value
+    tile: Value
+    prev: Value
+
+
+@dataclass(frozen=True)
+class RowSumOp(Op):
+    """Row-wise sum, accumulated with a previous column vector.
+
+    result[r] = sum_over_cols(tile[r, :]) + prev[r]
+    """
+    result: Value
+    tile: Value
+    prev: Value
+
+
+@dataclass(frozen=True)
+class SubRowOp(Op):
+    """Broadcast-subtract a column vector from each row: result[r,c] = tile[r,c] - vec[r]."""
+    result: Value
+    tile: Value
+    vec: Value
+
+
+@dataclass(frozen=True)
+class MulRowOp(Op):
+    """Broadcast-multiply each row by a column vector: result[r,c] = tile[r,c] * vec[r]."""
+    result: Value
+    tile: Value
+    vec: Value
+
+
+@dataclass(frozen=True)
+class DivRowOp(Op):
+    """Broadcast-divide each row by a column vector: result[r,c] = tile[r,c] / vec[r]."""
+    result: Value
+    tile: Value
+    vec: Value
 
 
 # ---------------------------------------------------------------------------
